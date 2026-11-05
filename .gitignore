@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local configuration and databases
+.env
+.env.*.local
+*.sqlite3
+
+# Node / Vite
+node_modules/
+dist/
+frontend/.env
+frontend/.env.local
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Future provider credentials: keep examples only
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx

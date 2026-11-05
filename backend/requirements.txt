@@ -1,0 +1,6 @@
+fastapi[standard]
+pymongo
+mongomock
+pydantic-settings
+httpx
+pytest

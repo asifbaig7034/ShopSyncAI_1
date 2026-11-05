@@ -1,0 +1,19 @@
+# Optional persistent database for the local UC-2 demo.
+# Do not expose an unauthenticated MongoDB server outside localhost.
+services:
+  mongo:
+    image: mongo:8.0
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - shopsync_mongo_data:/data/db
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - shopsync_ollama_data:/root/.ollama
+
+volumes:
+  shopsync_mongo_data:
+  shopsync_ollama_data:
