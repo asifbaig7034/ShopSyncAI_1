@@ -24,6 +24,7 @@ def test_combined_results_come_from_saved_business_data_and_are_audited(demo):
     assert "inventory_logistics" in body["routed_agents"]
     assert "customer_commerce" in body["routed_agents"]
     assert body["mode"] == "rule-based-demo"
+    assert isinstance(body["routing_seconds"], float) and body["routing_seconds"] >= 0
     assert any("LLM" in warning for warning in body["warnings"])
     assert db.agent_runs.count_documents({"owner_id": sample["owner_id"]}) == 1
     assert db.system_events.count_documents({"owner_id": sample["owner_id"], "event_type": "audit.uc2.request"}) == 1
@@ -33,6 +34,7 @@ def test_clarification_resumes_same_conversation_and_history(demo):
     client, _, _, headers = demo
     first = client.post("/api/owner/chat", headers=headers, json={"message": "Show me"}).json()
     assert first["needs_clarification"] is True
+    assert isinstance(first["routing_seconds"], float) and first["routing_seconds"] >= 0
     second = client.post("/api/owner/chat", headers=headers, json={"message": "stock", "conversation_id": first["conversation_id"]}).json()
     assert second["needs_clarification"] is False
     assert second["conversation_id"] == first["conversation_id"]
@@ -83,6 +85,19 @@ def test_persistent_llm_failure_is_visible_to_owner_in_demo_mode(demo, monkeypat
     body = client.post("/api/owner/chat", headers=headers, json={"message": "Show stock"}).json()
     assert body["mode"] == "rule-based-demo"
     assert any("LLM failed" in warning for warning in body["warnings"])
+
+
+def test_slow_clarification_reports_routing_time(demo, monkeypatch):
+    client, _, _, headers = demo
+    monkeypatch.setattr(coordinator, "classify_owner_request", lambda *_: (None, "unconfigured"))
+    times = iter([0.0, 3.25])
+    monkeypatch.setattr(coordinator, "perf_counter", lambda: next(times))
+    response = client.post("/api/owner/chat", headers=headers, json={"message": "Show me"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["needs_clarification"] is True
+    assert body["routing_seconds"] == 3.25
+    assert any("Intent routing took 3.25s" in warning for warning in body["warnings"])
 
 
 def test_history_returns_latest_100_records_in_chronological_order(demo):

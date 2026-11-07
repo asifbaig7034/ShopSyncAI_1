@@ -22,6 +22,7 @@ class OwnerChatResponse(BaseModel):
     routed_agents: list[str] = Field(default_factory=list)
     needs_clarification: bool = False
     mode: str
+    routing_seconds: float = Field(ge=0)
     warnings: list[str] = Field(default_factory=list)
     approval_request_id: str | None = None
 

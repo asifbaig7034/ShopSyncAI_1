@@ -34,7 +34,7 @@ def _owner_record(db, owner_id: str) -> dict | None:
 def _llm_warning(status: str) -> str | None:
     return {
         "unconfigured": "LLM is not configured. Local demo rules were used; this does not complete the SRS LLM requirement.",
-        "failed": "LLM failed or was rejected. Transient failures are retried; local demo rules were used instead.",
+        "failed": "LLM failed or was rejected. Transient failures may be retried once when time permits; local demo rules were used instead.",
         "blocked": "LLM was not called because this request may contain private data. Local demo rules were used.",
     }.get(status)
 
@@ -100,6 +100,9 @@ def process_owner_request(db, owner_id: str, message: str, conversation_id: str 
             for order in current_orders
         )
     if (not meaningful and not outside) or (pending_action == "refund" and not target_found):
+        routing_seconds = perf_counter() - started
+        if routing_seconds > 3.0:
+            warnings.append(f"Intent routing took {routing_seconds:.2f}s; target is at most 3s before agent processing.")
         save_pending(db, session, full_request)
         response = {
             "conversation_id": session["_id"],
@@ -111,6 +114,7 @@ def process_owner_request(db, owner_id: str, message: str, conversation_id: str 
             "routed_agents": [],
             "needs_clarification": True,
             "mode": mode,
+            "routing_seconds": routing_seconds,
             "warnings": warnings,
             "approval_request_id": None,
         }
@@ -167,6 +171,7 @@ def process_owner_request(db, owner_id: str, message: str, conversation_id: str 
         "routed_agents": routed_agents,
         "needs_clarification": False,
         "mode": mode,
+        "routing_seconds": routing_seconds,
         "warnings": warnings,
         "approval_request_id": approval_request_id,
     }

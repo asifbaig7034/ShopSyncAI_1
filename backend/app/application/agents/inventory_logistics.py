@@ -27,3 +27,12 @@ def handle(db, owner_id: str, intent: str, message: str) -> str:
             low = " (low stock)" if isinstance(quantity, int) and isinstance(threshold, int) and quantity < threshold else ""
             lines.append(f"{name}: {amount}{low}")
     return ("Products" if intent == "products" else "Stock") + ":\n" + "\n".join(lines)
+
+
+def on_demand_spike(event: dict) -> dict:
+    """Acknowledge a fictional demand signal without changing product stock."""
+    return {
+        "agent": CODE,
+        "status": "observed_demo_only",
+        "note": "Demand signal received. Reorder forecasting is not implemented yet.",
+    }

@@ -5,7 +5,7 @@ Run from the repository root after starting FastAPI::
     python -m backend.scripts.verify_uc2
 
 The check does not create an order, approve a refund, or send a customer message.
-It does record one owner chat and a repeatable synthetic low-stock event.
+It records an owner chat and two repeatable synthetic cross-agent events.
 """
 
 from __future__ import annotations
@@ -125,6 +125,17 @@ def main() -> int:
         event_list = _request_json(url, "/api/owner/demo-events", token)
         _check(any(event.get("event_id") == first["event_id"] and event.get("status") == "coordinated" and event.get("agent_responses") for event in event_list.get("events", [])), "No acknowledged cross-agent low-stock event was saved.")
         print("PASS Synthetic low-stock event reached another agent, was acknowledged, and did not duplicate.")
+        demand_first = _request_json(url, "/api/owner/demo-events/demand-spike", token, {})
+        demand_repeat = _request_json(url, "/api/owner/demo-events/demand-spike", token, {})
+        _check(bool(demand_first.get("event_id")) and demand_first["event_id"] == demand_repeat.get("event_id") and demand_repeat.get("created") is False, "Demand event was not deduplicated.")
+        event_list = _request_json(url, "/api/owner/demo-events", token)
+        _check(any(
+            event.get("event_id") == demand_first["event_id"] and event.get("event_type") == "demand.spike"
+            and event.get("status") == "coordinated"
+            and any(row.get("agent") == "inventory_logistics" for row in event.get("agent_responses", []))
+            for event in event_list.get("events", [])
+        ), "Demand event did not reach the Inventory & Logistics demo agent.")
+        print("PASS Fictional demand event reached a second domain, was acknowledged, and did not duplicate.")
         if not settings.mongodb_uri:
             print("NOTE MongoDB URI is empty: history and events will reset when the backend restarts.")
         else:

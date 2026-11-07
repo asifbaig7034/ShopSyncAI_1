@@ -113,6 +113,16 @@ stored event and agent response. Repeating the POST reuses its event ID, so
 it does not create a second event or reprocess an acknowledged one. This is a
 simulation: it does not notify a live customer or change stock.
 
+Use **POST /api/owner/demo-events/demand-spike** to send a second, explicitly
+fictional event from Customer & Commerce to Inventory & Logistics. Its order
+count is made up for the demo, not inferred from actual orders. The read-only
+receiver acknowledges it without changing product stock. A future agent can
+subscribe to a declared event type by registering its handler in
+`application/events/dispatcher.py`. Disabled agents do not receive events.
+Failed subscribers can be retried by republishing the same event ID without
+repeating successful acknowledgements. This is at-least-once delivery: future
+subscribers that make business changes must deduplicate actions by event ID.
+
 The response identifies its mode. **Local rules demo** means no AI provider
 answered the request; this is a runnable prototype, **not full SRS UC-2
 completion**. No action that changes a price, issues a refund, or publishes a
@@ -129,8 +139,8 @@ from the project root with the same `.env` file:
 ```
 
 This local check makes a fictional owner request, confirms the two demo agents
-produced one combined saved answer, and records an acknowledged/deduplicated
-synthetic low-stock event. It does not place orders, change stock, refund a
+produced one combined saved answer, and records acknowledged/deduplicated
+synthetic low-stock and demand-spike events. It does not place orders, change stock, refund a
 payment, or send messages to customers. For **either** configured LLM it
 **fails** unless it receives a verified model classification:
 
@@ -186,9 +196,32 @@ PowerShell command above. Look for `PASS ollama classified` and a chat badge
 facts still come from your MongoDB data. This is a fictional, owner-only
 prototype: do not treat it as the completed UC-1 or customer chat.
 
-The first CPU request can be slow while the model loads. Routing above three
-seconds is reported in a warning; this local setup does not guarantee the SRS
-performance target. If the model is missing, run the pull command again.
+Before measuring UC-2 routing, preload Ollama and prime the classifier with
+one fictional request. Run these from the project root after
+`docker compose up -d ollama` and the model pull:
+
+```powershell
+python -m backend.scripts.warm_ollama
+```
+
+Keep FastAPI running in a second terminal, then measure three fictional owner
+requests in the first terminal:
+
+```powershell
+python -m backend.scripts.measure_uc2_routing
+```
+
+The warm-up's first classification may take longer than three seconds; it is
+completed before any owner chat timing begins. Each API response includes
+`routing_seconds`, measured after request classification and before the agents
+process it. A run passes the 3-second
+target only when all three requests use `mode=ollama` and each routing time is
+at most 3 seconds. Preloading and `keep_alive=30m` avoid the first-request
+model load, but they do not guarantee fast enough CPU inference; if a run is
+slow, report the measured values rather than claiming this SRS target is met.
+The preloaded model uses local RAM while it stays loaded. Run the warm-up again
+after Ollama restarts or the keep-alive expires. If the model is missing, run
+the pull command again.
 If Ollama is not running, the app truthfully falls back to `Local rules demo`
 and `--require-llm` fails instead of claiming AI was used.
 

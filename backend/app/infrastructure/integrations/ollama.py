@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from time import monotonic, sleep
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -89,6 +90,9 @@ def classify_local_request(message: str, settings=None) -> tuple[list[str] | Non
         ],
         "format": schema,
         "stream": False,
+        # Each classification renews the preload window; Ollama otherwise
+        # resets the model to its shorter default idle lifetime.
+        "keep_alive": "30m",
         "options": {"temperature": 0, "num_predict": 128},
     }
     request = Request(
@@ -97,13 +101,33 @@ def classify_local_request(message: str, settings=None) -> tuple[list[str] | Non
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with _open_local(request, timeout=settings.ollama_timeout_seconds) as response:
-            raw = json.loads(response.read(65_536))
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UnicodeDecodeError):
-        return None, "failed"
-    if not isinstance(raw, dict) or raw.get("done") is not True:
-        return None, "failed"
-    body = raw.get("message")
-    intents = parse_intent_json(body.get("content") if isinstance(body, dict) else None)
-    return (intents, "ollama") if intents else (None, "failed")
+    # Make at most two attempts within one shared time budget. A quick Ollama
+    # outage can recover; the first attempt reserves time for a retry even
+    # when its socket times out. Invalid replies and permanent HTTP errors
+    # must not be retried or presented as valid model classifications.
+    budget = settings.ollama_timeout_seconds
+    deadline = monotonic() + budget
+    for attempt in range(2):
+        remaining = deadline - monotonic()
+        if remaining < 0.1:
+            break
+        attempt_timeout = min(remaining, budget * 0.7) if attempt == 0 else remaining
+        try:
+            with _open_local(request, timeout=attempt_timeout) as response:
+                raw = json.loads(response.read(65_536))
+        except HTTPError as error:
+            if error.code not in (408, 429, 500, 502, 503, 504):
+                return None, "failed"
+        except (URLError, TimeoutError, OSError):
+            pass
+        except (ValueError, UnicodeDecodeError):
+            return None, "failed"
+        else:
+            if not isinstance(raw, dict) or raw.get("done") is not True:
+                return None, "failed"
+            body = raw.get("message")
+            intents = parse_intent_json(body.get("content") if isinstance(body, dict) else None)
+            return (intents, "ollama") if intents else (None, "failed")
+        if attempt == 0 and deadline - monotonic() > 0.15:
+            sleep(0.05)
+    return None, "failed"
