@@ -1,13 +1,24 @@
-# ShopSync AI - UC-2 Owner-to-Orchestrator prototype
+# ShopSync AI - UC-1 owner account and UC-2 orchestrator prototype
 
-This repository implements **only UC-2, Send Request to Orchestrator**. The
-Business Owner types a natural-language request into a small React chat.
-FastAPI checks a local demo owner token, identifies relevant enabled handlers,
+This repository implements **UC-2, Send Request to Orchestrator**, and the
+UC-1 owner-account flows (signup, login, logout, settings and password recovery). The Business Owner
+types a natural-language request into a small React chat. FastAPI checks an
+expiring owner session (or the older local-only demo token for verification), identifies relevant enabled handlers,
 obtains sample data-backed results, and displays one combined answer. Owner
 requests, responses, approval proposals, and agent events are recorded in the
-shared data layer. Real account login, customer WhatsApp, order execution,
-shipping, payments, social publishing, and the rest of UC-1/UC-3-UC-10 are not
-implemented here.
+shared data layer. Customer WhatsApp, order execution, shipping, payments,
+social publishing, and later UC-1/UC-3-UC-10 features are not implemented
+here. Staff accounts, Instagram, Facebook, courier and payment integrations
+are later UC-1 steps. WhatsApp account read access can now be verified; this
+does not activate WhatsApp customer messaging or webhooks.
+
+The owner can edit the brand name, contact, currency and preferred language in
+**Settings**, and turn the two working read-only agents on or off. Settings
+are saved for the signed-in real owner. Turning both agents off prevents owner
+chat from answering until one is enabled. Other agents remain future work.
+Currency and language are saved as preferences for later flows; changing the
+currency does not convert existing demo product/order prices or the current
+agent replies, which still display their stored PKR amounts.
 
 The two working **demo** domains are Customer & Commerce (saved sample orders)
 and Supply Chain & Operations (sample products and stock). The eventual architecture
@@ -17,8 +28,8 @@ sample records; it is not a live external integration.
 ## Requirements
 
 - Python 3.11+ and Node.js compatible with the installed Vite release.
-- Docker is **optional** for persistent local MongoDB and for the free local
-  Ollama LLM; CPU inference may be slower than the SRS routing target.
+- Docker is **optional** for persistent local MongoDB, the free local Ollama
+  LLM and the Mailpit test inbox; CPU inference may be slower than the SRS routing target.
 - UC-2 needs a configured, verified LLM for its normal flow. Choose local
   Ollama without a key or use Gemini when your Google project allows it.
 
@@ -52,8 +63,83 @@ npm run dev
 ```
 
 Open the Vite URL shown in the terminal (`http://127.0.0.1:5173`).
-Paste the **demo token** into the owner's local sign-in field. It is held only
-in the open browser tab, not added to the frontend build or its environment.
+Create the owner account for your brand, then log in from the web app. Passwords
+are Argon2-hashed in MongoDB; only a digest of the random 12-hour session token
+is stored there. The web app keeps the returned bearer token in memory, so a
+page reload requires logging in again. Account creation is restricted to the
+local machine and to one real owner account for this single-brand prototype.
+The seeded fictional demo owner remains separate for the existing UC-2 verifier.
+
+## UC-1 first step: owner account
+
+Start MongoDB, install the new backend dependencies, and restart FastAPI before
+opening the frontend:
+
+```powershell
+docker compose -p shopsync-ai up -d mongo
+python -m pip install -r backend/requirements.txt
+python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Create the account on `http://127.0.0.1:5173`, enter your own email and a
+password of at least 12 characters, then open Owner Chat. A new owner's
+products and orders are initially empty: the fictional Cotton Shirt and
+DEMO-1001 belong to the separate seeded demo owner. Add your brand's records
+under your new owner ID in MongoDB until product/order forms exist. Password
+recovery uses a single-use code sent by configured SMTP (see below).
+
+## UC-1 password recovery (local email demo)
+
+Start the optional Mailpit inbox alongside MongoDB, then set `SMTP_HOST=127.0.0.1`
+in your **existing, private** project-root `.env` file. If absent, also set
+`SMTP_PORT=1025` and `SMTP_FROM=shopsync@localhost`. Do not replace your
+existing `.env` or commit it. Restart FastAPI after changing `.env`.
+
+```powershell
+docker compose -p shopsync-ai up -d mongo mailpit
+```
+
+Open `http://127.0.0.1:8025` to inspect the local test inbox. From the app's
+login screen choose **Forgot password?**, submit the real owner's email, open
+the message in Mailpit, copy the code into the app, and choose a new password.
+After a successful reset log in again; earlier owner sessions are invalid.
+The same request confirmation is shown whether or not an owner uses that email.
+Mailpit captures messages locally and does **not** deliver them to real email
+inboxes. Its SMTP and web ports are bound to loopback in `compose.yaml`. To
+deliver real email, configure an authenticated TLS SMTP provider and use a
+private deployment; do not expose this local account prototype on a public
+network. The reset code is never returned by the API or displayed in the app.
+
+## UC-1 WhatsApp Business API read-access check
+
+The owner Settings screen can verify that a Meta access token can list a
+specified phone number under a specified WhatsApp Business Account (WABA).
+This needs your WABA ID, phone-number ID and a Meta-issued access token; no
+such credentials are included in the repository. The backend calls Meta's
+Graph API before saving the token and shows **Meta read access verified** only
+when that exact number appears. This confirms read access, not permission to
+send customer messages, a registered phone number or a working webhook;
+UC-3 must implement and test those separately.
+
+Install the current backend requirements if needed, then create an encryption
+key **once** from the project root:
+
+```powershell
+python -m pip install -r backend/requirements.txt
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Copy the generated key into `INTEGRATION_ENCRYPTION_KEY=` in your existing
+project-root `.env`. Keep it private, do not commit `.env`, and do not replace
+this key after connecting: without it, the saved token cannot be decrypted.
+Keep `META_GRAPH_VERSION=v26.0` unless Meta instructs you to use another
+supported version. Restart FastAPI; in the owner Settings screen enter the
+three values and choose **Verify and save**. The token is sent directly to
+your backend and is never returned by the settings/status API. **Recheck
+access** calls Meta again, while **Remove saved connection** deletes only the
+local credentials and does not disconnect or deregister the phone number at
+Meta. Without genuine Meta credentials, leave the status **Not connected**;
+no mock connection is presented as live.
 
 ## Run locally (Windows PowerShell)
 

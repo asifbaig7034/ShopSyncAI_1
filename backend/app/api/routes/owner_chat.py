@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ...application.orchestrator.coordinator import process_owner_request
-from ...core.security import require_demo_owner
+from ...core.security import require_owner
 from ...infrastructure.db.mongo import database_for_request
 from ...infrastructure.db.repositories import history_for_owner
 from ..schemas.chat import OwnerChatHistoryResponse, OwnerChatRequest, OwnerChatResponse
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/owner/chat", tags=["UC-2: Owner Orchestrator Cha
 def send_owner_request(
     payload: OwnerChatRequest,
     request: Request,
-    owner: dict = Depends(require_demo_owner),
+    owner: dict = Depends(require_owner),
 ) -> OwnerChatResponse:
     if not any(owner.get("agent_settings", {}).values()):
         raise HTTPException(status_code=409, detail="Enable at least one agent before sending a request.")
@@ -38,7 +38,7 @@ def send_owner_request(
 def read_owner_history(
     request: Request,
     conversation_id: str = Query(min_length=1, max_length=100),
-    owner: dict = Depends(require_demo_owner),
+    owner: dict = Depends(require_owner),
 ) -> OwnerChatHistoryResponse:
     rows = history_for_owner(database_for_request(request), str(owner["_id"]), conversation_id)
     return OwnerChatHistoryResponse(conversation_id=conversation_id, messages=rows)

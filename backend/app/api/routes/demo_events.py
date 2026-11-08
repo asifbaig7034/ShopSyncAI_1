@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ...application.events.dispatcher import publish_event, publish_low_stock
 from ...application.events.event_types import DEMAND_SPIKE, FRAUD_FLAG, LOW_STOCK
-from ...core.security import require_demo_owner
+from ...core.security import require_owner
 from ...infrastructure.db.mongo import database_for_request
 
 
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api/owner/demo-events", tags=["UC-2: Demo Agent Even
 
 
 @router.post("/low-stock")
-def demonstrate_low_stock(request: Request, owner: dict = Depends(require_demo_owner)) -> dict:
+def demonstrate_low_stock(request: Request, owner: dict = Depends(require_owner)) -> dict:
     """Record a repeatable synthetic event; do not change product/order data."""
     if not owner.get("agent_settings", {}).get("inventory_logistics", False):
         raise HTTPException(status_code=409, detail="Enable the Inventory & Logistics demo agent first.")
@@ -48,7 +48,7 @@ def demonstrate_low_stock(request: Request, owner: dict = Depends(require_demo_o
 
 
 @router.post("/demand-spike")
-def demonstrate_demand_spike(request: Request, owner: dict = Depends(require_demo_owner)) -> dict:
+def demonstrate_demand_spike(request: Request, owner: dict = Depends(require_owner)) -> dict:
     """Send a fictional demand signal; it does not represent real order counts."""
     if not owner.get("agent_settings", {}).get("customer_commerce", False):
         raise HTTPException(status_code=409, detail="Enable the Customer & Commerce demo agent first.")
@@ -72,7 +72,7 @@ def demonstrate_demand_spike(request: Request, owner: dict = Depends(require_dem
 
 
 @router.get("")
-def list_demo_events(request: Request, owner: dict = Depends(require_demo_owner)) -> dict:
+def list_demo_events(request: Request, owner: dict = Depends(require_owner)) -> dict:
     owner_id = str(owner["_id"])
     db = database_for_request(request)
     events = []

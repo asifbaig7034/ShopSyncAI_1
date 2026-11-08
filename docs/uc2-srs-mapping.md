@@ -8,7 +8,7 @@ focuses on a basic orchestrator and one or two functional agents.
 
 | SRS behavior | UC-2 code location | Prototype limitation |
 | --- | --- | --- |
-| Authenticated Business Owner; at least one agent enabled | `core/security.py`, `api/routes/owner_chat.py`, `application/orchestrator/coordinator.py` | The local owner token is a demo substitute for UC-1 login; it must never be used as production authentication. |
+| Authenticated Business Owner; at least one agent enabled | `core/security.py`, `api/routes/owner_chat.py`, `application/orchestrator/coordinator.py`, `api/routes/account.py` | UC-1 adds a real local owner account, expiring session, settings to enable/disable two working agents, SMTP-backed password recovery and a WhatsApp Meta read-access check. The older local demo token is retained only for UC-2 verification and cannot edit owner settings. WhatsApp messaging and the other channel integrations, plus staff roles, are later steps. |
 | LLM recognizes the request and selects relevant agents | `infrastructure/integrations/llm.py`, `infrastructure/integrations/ollama.py`, `application/orchestrator/intent_router.py` | Select Ollama (local model, no key) or Gemini (key and explicit synthetic-only flag). Run `python -m backend.scripts.verify_uc2 --require-llm` with a running backend to verify a real LLM response. Rules-only fallback does not fulfill the normal LLM flow. |
 | Clarification before routing | `application/orchestrator/clarification.py`, `history.py` | A pending request must retain its conversation ID. |
 | Relevant agents obtain stored business facts | `application/agents/customer_commerce.py`, `inventory_logistics.py` | Synthetic sample data and only two specialist domains exist in this UC-2 deliverable. |
@@ -29,8 +29,9 @@ FastAPI, React, or MongoDB as products.
 FR-01 and FR-02 mention Staff accounts, while the final use-case diagram has
 only Business Owner and Customer and NFR-01 restricts the dashboard to the
 Business Owner. This UC-2 starter follows the diagram and the stated
-single-brand, owner-only implementation decision. Reconcile the text before
-claiming full SRS compliance; UC-1 account and staff work is not included.
+single-brand, owner-only implementation decision. UC-1 adds owner login and
+profile/agent settings; staff work and the text/diagram discrepancy remain to be reconciled
+before claiming full SRS compliance.
 
 ## Gemini free-tier limit
 

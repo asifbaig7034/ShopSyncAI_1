@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +25,19 @@ class Settings(BaseSettings):
     # Classifying a real request can take longer than the three-second SRS
     # routing target. Keep an explicit bound and report slow routing to Owner.
     gemini_classify_timeout_seconds: float = Field(default=8.0, ge=1.0, le=30.0)
+    # Optional account recovery email. Leave the host empty until an SMTP
+    # server (for example local Mailpit) is available.
+    smtp_host: str = ""
+    smtp_port: int = Field(default=1025, ge=1, le=65535)
+    smtp_from: str = "shopsync@localhost"
+    smtp_starttls: bool = False
+    smtp_ssl: bool = False
+    smtp_username: str = ""
+    smtp_password: str = ""
+    # Keep this key in a private .env and reuse it after restarts. A missing or
+    # invalid key blocks connection writes; GET/DELETE remain available.
+    integration_encryption_key: SecretStr = SecretStr("")
+    meta_graph_version: str = Field(default="v26.0", pattern=r"^v[0-9]{1,3}\.[0-9]{1,2}$")
 
 
 @lru_cache(maxsize=1)

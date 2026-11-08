@@ -1,14 +1,12 @@
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 
 async function request(path, token, options = {}) {
-  if (!token) throw new Error('Enter the local demo owner token to continue.');
-
   let response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
         ...options.headers,
       },
@@ -35,6 +33,63 @@ async function request(path, token, options = {}) {
     throw new Error(message);
   }
   return data;
+}
+
+export function registerOwner({ name, email, businessName, password }) {
+  return request('/api/account/signup', null, {
+    method: 'POST',
+    body: JSON.stringify({ name, email, business_name: businessName, password }),
+  });
+}
+
+export function loginOwner({ email, password }) {
+  return request('/api/account/login', null, {
+    method: 'POST', body: JSON.stringify({ email, password }),
+  });
+}
+
+export function requestPasswordReset({ email }) {
+  return request('/api/account/password-reset/request', null, {
+    method: 'POST', body: JSON.stringify({ email }),
+  });
+}
+
+export function confirmPasswordReset({ email, code, password }) {
+  return request('/api/account/password-reset/confirm', null, {
+    method: 'POST', body: JSON.stringify({ email, code, password }),
+  });
+}
+
+export function logoutOwner(token) {
+  return request('/api/account/logout', token, { method: 'POST' });
+}
+
+export function getOwnerSettings(token) {
+  return request('/api/account/settings', token);
+}
+
+export function updateOwnerSettings(token, changes) {
+  return request('/api/account/settings', token, {
+    method: 'PATCH', body: JSON.stringify(changes),
+  });
+}
+
+export function getWhatsAppStatus(token) {
+  return request('/api/integrations/whatsapp', token);
+}
+
+export function connectWhatsApp(token, details) {
+  return request('/api/integrations/whatsapp/connect', token, {
+    method: 'POST', body: JSON.stringify(details),
+  });
+}
+
+export function verifyWhatsApp(token) {
+  return request('/api/integrations/whatsapp/verify', token, { method: 'POST' });
+}
+
+export function disconnectWhatsApp(token) {
+  return request('/api/integrations/whatsapp', token, { method: 'DELETE' });
 }
 
 export function sendOwnerRequest({ token, message, conversationId }) {

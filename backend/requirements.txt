@@ -4,3 +4,6 @@ mongomock
 pydantic-settings
 httpx
 pytest
+pwdlib[argon2]
+email-validator
+cryptography

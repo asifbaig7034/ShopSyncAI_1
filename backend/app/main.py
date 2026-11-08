@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api.routes.demo_events import router as demo_events_router
+from .api.routes.account import router as account_router
+from .api.routes.integrations import router as integrations_router
 from .api.routes.owner_chat import router as owner_chat_router
 from .core.config import get_settings
 
@@ -20,9 +22,11 @@ def create_app(database: Any = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
+    application.include_router(account_router)
+    application.include_router(integrations_router)
     application.include_router(owner_chat_router)
     application.include_router(demo_events_router)
 

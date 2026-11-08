@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { getOwnerHistory, sendOwnerRequest } from '../../api/client.js';
+import SettingsPanel from '../setup/SettingsPanel.jsx';
 
-const SESSION_KEY = 'shopsync-uc2-conversation-id';
+const conversationKey = (ownerId) => `shopsync-uc2-conversation-id:${ownerId}`;
 const EXAMPLES = [
   'Show products and low stock',
   'Show recent orders',
   'Show me',
 ];
 
-function savedConversationId() {
-  try { return sessionStorage.getItem(SESSION_KEY) || ''; }
+function savedConversationId(ownerId) {
+  try { return sessionStorage.getItem(conversationKey(ownerId)) || ''; }
   catch { return ''; }
 }
 
@@ -52,15 +53,16 @@ function ChatMessage({ item }) {
   );
 }
 
-export default function OwnerChatPage() {
-  const [tokenDraft, setTokenDraft] = useState('');
-  const [token, setToken] = useState('');
-  const [conversationId, setConversationId] = useState(savedConversationId);
+export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
+  const token = session.access_token;
+  const [conversationId, setConversationId] = useState(() => savedConversationId(session.owner.id));
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState([]);
   const [busy, setBusy] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [notice, setNotice] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
   const bottomRef = useRef(null);
   const justCreatedConversation = useRef('');
   const historyRevision = useRef(0);
@@ -92,17 +94,10 @@ export default function OwnerChatPage() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [messages, busy]);
 
-  function useToken(event) {
-    event.preventDefault();
-    historyRevision.current += 1;
-    setToken(tokenDraft.trim());
-    setNotice('');
-  }
-
   function resetConversation() {
     historyRevision.current += 1;
     justCreatedConversation.current = '';
-    try { sessionStorage.removeItem(SESSION_KEY); } catch { /* Storage is optional. */ }
+    try { sessionStorage.removeItem(conversationKey(session.owner.id)); } catch { /* Storage is optional. */ }
     setConversationId('');
     setMessages([]);
     setMessage('');
@@ -123,7 +118,7 @@ export default function OwnerChatPage() {
       const data = await sendOwnerRequest({ token, message: text, conversationId });
       if (data.conversation_id && data.conversation_id !== conversationId) {
         justCreatedConversation.current = data.conversation_id;
-        try { sessionStorage.setItem(SESSION_KEY, data.conversation_id); } catch { /* Storage is optional. */ }
+        try { sessionStorage.setItem(conversationKey(session.owner.id), data.conversation_id); } catch { /* Storage is optional. */ }
         setConversationId(data.conversation_id);
       }
       setMessages((items) => [...items, {
@@ -146,45 +141,45 @@ export default function OwnerChatPage() {
   return (
     <div className="app-shell">
       <header className="site-header">
-        <div className="brand"><span className="brand__mark" aria-hidden="true">S</span><span>ShopSync <strong>AI</strong></span></div>
-        <span className="header-context">UC-2 · Owner workspace</span>
+        <div className="brand brand--logo"><img src="/shopsync-logo.png" alt="ShopSync AI" /></div>
+        <span className="header-context">Owner workspace</span>
       </header>
 
       <main className="workspace">
         <section className="intro" aria-labelledby="page-title">
-          <div className="eyebrow">AGENT ORCHESTRATION</div>
-          <h1 id="page-title">Ask your business a question.</h1>
-          <p>Your request is routed to available agent handlers, and their results come back in one answer.</p>
+          <div className="eyebrow">{settingsOpen ? 'OWNER SETTINGS' : 'AGENT ORCHESTRATION'}</div>
+          <h1 id="page-title">{settingsOpen ? 'Set up your brand.' : 'Ask your business a question.'}</h1>
+          <p>{settingsOpen ? 'Update your business profile and choose the agents available to answer owner requests.' : 'Your request is routed to available agent handlers, and their results come back in one answer.'}</p>
         </section>
 
         <div className="workspace-grid">
-          <aside className="side-panel" aria-label="Local setup and demo guide">
-            <div className="panel-label">LOCAL SETUP</div>
-            <h2>Owner access</h2>
-            <p>Until UC-1 login is ready, enter the local demo token from your backend configuration.</p>
-            <form onSubmit={useToken} className="token-form">
-              <label htmlFor="owner-token">Demo owner token</label>
-              <input id="owner-token" type="password" autoComplete="off" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} placeholder="Enter local token" />
-              <button type="submit" className="button button--secondary" disabled={!tokenDraft.trim()}>{token ? 'Update token' : 'Use token'}</button>
-            </form>
-            <div className="connection-status" role="status"><span className={token ? 'status-dot status-dot--set' : 'status-dot'} />{token ? 'Token set for this tab' : 'Token required to chat'}</div>
+          <aside className="side-panel" aria-label="Owner and demo guide">
+            <div className="panel-label">SIGNED IN</div>
+            <h2>{session.owner.business_name}</h2>
+            <p>{session.owner.name}<br />{session.owner.email}</p>
+            <button className="button button--secondary" type="button" onClick={onLogout} disabled={busy || savingSettings}>Log out</button>
+            <div className="connection-status" role="status"><span className="status-dot status-dot--set" />Owner account active</div>
             <div className="sidebar-divider" />
             <div className="panel-label">FOR YOUR FYP DEMO</div>
             <ul className="guide-list">
               <li>Use fictional product and order data.</li>
               <li>AI classification runs only when configured.</li>
-              <li>Actual agent integrations belong to later use cases.</li>
+              <li>WhatsApp read access can be checked in Settings; live customer messaging belongs to UC-3.</li>
             </ul>
             <p className="privacy-note">Use fictional prompts for this FYP demo. Local Ollama needs no cloud key; do not enter a real customer’s personal information.</p>
           </aside>
 
           <section className="chat-panel" aria-label="Owner chat">
             <div className="chat-header">
-              <div><div className="panel-label">OWNER CHAT</div><h2>Orchestrator</h2></div>
-              <button className="button button--quiet" type="button" onClick={resetConversation} disabled={busy}>New chat</button>
+              <div><div className="panel-label">{settingsOpen ? 'ACCOUNT SETUP' : 'OWNER CHAT'}</div><h2>{settingsOpen ? 'Settings' : 'Orchestrator'}</h2></div>
+              <div className="chat-header__actions">
+                <button className="button button--quiet" type="button" onClick={() => setSettingsOpen(!settingsOpen)} disabled={busy || savingSettings}>{settingsOpen ? 'Back to chat' : 'Settings'}</button>
+                {!settingsOpen && <button className="button button--quiet" type="button" onClick={resetConversation} disabled={busy}>New chat</button>}
+              </div>
             </div>
-            {notice && <div className="notice" role="alert">{notice}</div>}
-            <div className="chat-messages" aria-live="polite" aria-busy={busy || loadingHistory}>
+            {settingsOpen ? <SettingsPanel token={token} onProfileSaved={onProfileSaved} onSavingChange={setSavingSettings} /> : <>
+              {notice && <div className="notice" role="alert">{notice}</div>}
+              <div className="chat-messages" aria-live="polite" aria-busy={busy || loadingHistory}>
               {loadingHistory && <div className="loading">Loading saved conversation…</div>}
               {!loadingHistory && messages.length === 0 && (
                 <div className="empty-chat">
@@ -199,15 +194,16 @@ export default function OwnerChatPage() {
               {messages.map((item) => <ChatMessage key={item.id} item={item} />)}
               {busy && <div className="loading" role="status">Coordinating available agents…</div>}
               <div ref={bottomRef} />
-            </div>
-            <form className="composer" onSubmit={send}>
+              </div>
+              <form className="composer" onSubmit={send}>
               <label htmlFor="owner-message">Your request</label>
               <div className="composer__row">
-                <textarea id="owner-message" rows="2" maxLength="2000" value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!busy && !loadingHistory) event.currentTarget.form?.requestSubmit(); } }} placeholder={token ? 'Ask about your products, stock, or orders…' : 'Enter your demo token first…'} disabled={!token || busy || loadingHistory} />
-                <button type="submit" className="button button--primary" disabled={!token || !message.trim() || busy || loadingHistory}>Send <span aria-hidden="true">↗</span></button>
+                <textarea id="owner-message" rows="2" maxLength="2000" value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!busy && !loadingHistory) event.currentTarget.form?.requestSubmit(); } }} placeholder="Ask about your products, stock, or orders…" disabled={busy || loadingHistory} />
+                <button type="submit" className="button button--primary" disabled={!message.trim() || busy || loadingHistory}>Send <span aria-hidden="true">↗</span></button>
               </div>
               <div className="composer__hint">Enter to send · Shift+Enter for a new line · Results use saved demonstration data</div>
-            </form>
+              </form>
+            </>}
           </section>
         </div>
       </main>
