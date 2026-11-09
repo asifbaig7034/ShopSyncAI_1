@@ -172,8 +172,9 @@ class OrderFlowTests(unittest.TestCase):
         order = self.draft()
         edited = self.call("PATCH", f"/api/orders/{order['id']}/draft", {
             "items": [{"product_id": self.product["id"], "quantity": 2}],
-            "delivery_address": "Updated Lahore address"})
+            "delivery_address": "Updated Lahore address", "payment_method": "BANK_TRANSFER"})
         self.assertEqual(edited["total_cents"], 300000)
+        self.assertEqual(edited["payment_method"], "BANK_TRANSFER")
         self.assertEqual(self.stock(), 2)
         self.call("POST", f"/api/orders/{order['id']}/confirm")
         self.call("PATCH", f"/api/orders/{order['id']}/draft", {
@@ -183,8 +184,12 @@ class OrderFlowTests(unittest.TestCase):
     def test_simulated_chat_ownership_and_duplicate_webhook_message(self):
         message_id = uuid.uuid4().hex
         payload = {"message_id": message_id, "phone": "923001234567", "name": "Ayesha",
-                   "text": "ORDER TEE-01 1 | Lahore delivery address"}
+                   "text": "ORDER TEE-01 1 | Lahore delivery address | BANK_TRANSFER"}
         reply = self.call("POST", "/api/chat/simulate", payload)["reply"]
+        self.assertIn("Delivery address: Lahore delivery address", reply)
+        self.assertIn("Payment method: BANK_TRANSFER", reply)
+        self.assertIn("Customer: Ayesha (923001234567)", reply)
+        self.assertIn("Total: PKR 1,500.00", reply)
         self.assertEqual(self.call("POST", "/api/chat/simulate", payload)["reply"], reply)
         self.assertEqual(len(self.call("GET", "/api/orders")), 1)
         order_id = self.call("GET", "/api/orders")[0]["id"]
@@ -192,8 +197,10 @@ class OrderFlowTests(unittest.TestCase):
                  "text": f"STATUS {order_id}"}
         self.assertEqual(self.call("POST", "/api/chat/simulate", other)["reply"], "Order not found.")
         edit = {**other, "message_id": uuid.uuid4().hex, "phone": "923001234567",
-                "text": f"EDIT {order_id} TEE-01 2 | Updated Lahore address"}
-        self.assertIn("updated", self.call("POST", "/api/chat/simulate", edit)["reply"])
+                "text": f"EDIT {order_id} TEE-01 2 | Updated Lahore address | COD"}
+        edit_reply = self.call("POST", "/api/chat/simulate", edit)["reply"]
+        self.assertIn("Updated Lahore address", edit_reply)
+        self.assertIn("Payment method: COD", edit_reply)
         own = {**other, "message_id": uuid.uuid4().hex, "phone": "923001234567",
                "text": f"CONFIRM {order_id}"}
         self.assertIn("CONFIRMED", self.call("POST", "/api/chat/simulate", own)["reply"])
@@ -203,7 +210,7 @@ class OrderFlowTests(unittest.TestCase):
         os.environ["WA_APP_SECRET"] = "test-webhook-secret"
         payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
             "messages": [{"id": "wamid.test-1", "from": "923001234567", "type": "text",
-                          "text": {"body": "ORDER TEE-01 1 | Lahore"}}]}}]}]}
+                          "text": {"body": "ORDER TEE-01 1 | Lahore | COD"}}]}}]}]}
         data = json.dumps(payload).encode()
         self.assertEqual(self.client.post("/webhooks/whatsapp", content=data,
                                          headers={"x-hub-signature-256": "sha256=invalid"}).status_code, 403)
@@ -213,6 +220,75 @@ class OrderFlowTests(unittest.TestCase):
         self.assertEqual(self.client.post("/webhooks/whatsapp", content=data, headers=headers).status_code, 200)
         self.assertEqual(len(self.call("GET", "/api/orders")), 1)
         self.assertEqual(len(self.call("GET", "/api/notifications")), 1)
+        order_id = self.call("GET", "/api/orders")[0]["id"]
+        service.chat("wamid.test-confirm", "923001234567", f"CONFIRM {order_id}", live=True)
+        service.chat("wamid.test-refund", "923001234567", f"REFUND {order_id} Wrong item", live=True)
+        request_id = self.call("GET", f"/api/orders/{order_id}")["return_request"]["id"]
+        self.call("POST", f"/api/returns/{request_id}/decision",
+                  {"approve": False, "reason": "Outside policy"})
+        notifications = self.call("GET", "/api/notifications")
+        self.assertTrue(any("Reason: Outside policy" in entry["body"] for entry in notifications))
+
+    def test_chat_requires_explicit_payment_choice(self):
+        missing = {"message_id": uuid.uuid4().hex, "phone": "923001234567",
+                   "text": "ORDER TEE-01 1 | Lahore"}
+        reply = self.call("POST", "/api/chat/simulate", missing)["reply"]
+        self.assertIn("Choose payment method", reply)
+        invalid = {**missing, "message_id": uuid.uuid4().hex,
+                   "text": "ORDER TEE-01 1 | Lahore | CHEQUE"}
+        reply = self.call("POST", "/api/chat/simulate", invalid)["reply"]
+        self.assertIn("COD or BANK_TRANSFER", reply)
+        self.assertEqual(self.call("GET", "/api/orders"), [])
+        valid = {**missing, "message_id": uuid.uuid4().hex,
+                 "text": "ORDER TEE-01 1 | Lahore | COD"}
+        self.assertIn("Payment method: COD", self.call("POST", "/api/chat/simulate", valid)["reply"])
+        self.assertEqual(self.call("GET", "/api/orders")[0]["payment_method"], "COD")
+
+    def test_rejected_return_requires_reason_and_keeps_request_pending_without_one(self):
+        order = self.draft()
+        self.call("POST", f"/api/orders/{order['id']}/confirm")
+        requested = self.call("POST", f"/api/orders/{order['id']}/returns",
+                              {"kind": "REFUND", "reason": "Item damaged"}, 201)
+        request_id = requested["return_request"]["id"]
+        for note in ("", "   "):
+            response = self.call("POST", f"/api/returns/{request_id}/decision",
+                                 {"approve": False, "reason": note}, 400)
+            self.assertIn("rejection reason", response["detail"])
+        still_pending = self.call("GET", f"/api/orders/{order['id']}")
+        self.assertEqual(still_pending["return_request"]["status"], "PENDING")
+        rejected = self.call("POST", f"/api/returns/{request_id}/decision",
+                             {"approve": False, "reason": "Outside return policy"})
+        self.assertEqual(rejected["return_request"]["status"], "REJECTED")
+        self.assertEqual(rejected["return_request"]["owner_reason"], "Outside return policy")
+        status = self.call("POST", "/api/chat/simulate", {
+            "message_id": uuid.uuid4().hex, "phone": "923001234567",
+            "text": f"STATUS {order['id']}"})["reply"]
+        self.assertIn("Reason: Outside return policy", status)
+        self.assertEqual(self.call("GET", "/api/finance")["booked_net_cents"], 150000)
+
+    def test_rejected_returned_item_requires_reason_and_keeps_stock_unchanged(self):
+        order = self.draft()
+        self.call("POST", f"/api/orders/{order['id']}/confirm")
+        self.call("POST", f"/api/orders/{order['id']}/ship")
+        requested = self.call("POST", f"/api/orders/{order['id']}/returns",
+                              {"kind": "RETURN", "reason": "Wrong size"}, 201)
+        request_id = requested["return_request"]["id"]
+        self.call("POST", f"/api/returns/{request_id}/decision",
+                  {"approve": True, "reason": "Awaiting returned item"})
+        self.call("POST", f"/api/returns/{request_id}/inspect",
+                  {"accept": False, "reason": ""}, 400)
+        self.assertEqual(self.call("GET", f"/api/orders/{order['id']}")["return_request"]["status"],
+                         "APPROVED_AWAITING_RECEIPT")
+        rejected = self.call("POST", f"/api/returns/{request_id}/inspect",
+                             {"accept": False, "reason": "Item damaged beyond return policy"})
+        self.assertEqual(rejected["return_request"]["status"], "REJECTED_AFTER_INSPECTION")
+        self.assertEqual(rejected["return_request"]["owner_reason"], "Item damaged beyond return policy")
+        self.assertEqual(self.stock(), 1)
+        self.assertEqual(self.call("GET", "/api/finance")["booked_net_cents"], 150000)
+        status = self.call("POST", "/api/chat/simulate", {
+            "message_id": uuid.uuid4().hex, "phone": "923001234567",
+            "text": f"STATUS {order['id']}"})["reply"]
+        self.assertIn("Reason: Item damaged beyond return policy", status)
 
 
 if __name__ == "__main__":

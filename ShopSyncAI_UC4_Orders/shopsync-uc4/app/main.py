@@ -76,6 +76,7 @@ class DraftIn(BaseModel):
 class EditDraftIn(BaseModel):
     items: list[ItemIn]
     delivery_address: str
+    payment_method: Literal["COD", "BANK_TRANSFER"] | None = None
 
 
 class DecisionIn(BaseModel):
@@ -90,6 +91,7 @@ class ReturnIn(BaseModel):
 
 class InspectionIn(BaseModel):
     accept: bool
+    reason: str = Field(default="", max_length=500)
 
 
 class ChatIn(BaseModel):
@@ -152,7 +154,8 @@ def order(order_id: str):
 
 @app.patch("/api/orders/{order_id}/draft", dependencies=[Depends(owner)])
 def edit_draft(order_id: str, payload: EditDraftIn):
-    return service.edit_draft(order_id, [i.model_dump() for i in payload.items], payload.delivery_address)
+    return service.edit_draft(order_id, [i.model_dump() for i in payload.items],
+                              payload.delivery_address, payload.payment_method)
 
 
 @app.post("/api/orders/{order_id}/confirm", dependencies=[Depends(owner)])
@@ -187,7 +190,7 @@ def return_decision(request_id: str, payload: DecisionIn):
 
 @app.post("/api/returns/{request_id}/inspect", dependencies=[Depends(owner)])
 def inspect_return(request_id: str, payload: InspectionIn):
-    return service.receive_return(request_id, payload.accept)
+    return service.receive_return(request_id, payload.accept, payload.reason)
 
 
 @app.post("/api/chat/simulate", dependencies=[Depends(owner)])

@@ -2,6 +2,20 @@
 
 A runnable implementation of the **Manage Orders** use case in the ShopSync AI FYP specification. It includes an owner workspace, an order API, a customer-command simulator, optional Meta WhatsApp Cloud API webhooks and text replies, a SQLite database, and automated order-integrity tests. No AI service or payment credentials are needed for the local demonstration.
 
+See [PROGRESS.md](PROGRESS.md) for the current UC-4 requirement checklist, tests, and integration handoffs.
+
+## Update your existing folder (Windows)
+
+Keep using your current `ShopSyncAI_UC4_Orders/shopsync-uc4` folder. To apply the companion **code-only update ZIP**, stop the server with Ctrl+C, extract the ZIP, then copy its `app`, `static`, and `tests` directories and `README.md`, `PROGRESS.md`, and `requirements.txt` into the same existing `shopsync-uc4` directory. Accept replacement of the code files. The update ZIP does **not** contain `data` or `.venv`, so your orders/products and existing Python environment stay in place. The full updated archive is supplied separately as a backup and retains the attached database and environment.
+
+This update adds an explicit Pydantic dependency. From your existing `shopsync-uc4` directory, run the following **once after applying this update** (keep the existing `.venv`):
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
+```
+
+Then set `SHOPSYNC_OWNER_TOKEN` in the current PowerShell terminal and start Uvicorn using the commands below. Future code-only updates do not need a new environment; install packages again only when `requirements.txt` changes. The `.gitignore` excludes `data/` and `.venv/` from Git; check `git status` before committing the UC-4 code on your own branch.
+
 ## Start in five minutes
 
 Requirements: Python 3.10+ and `pip`.
@@ -15,20 +29,29 @@ export SHOPSYNC_OWNER_TOKEN="replace-this-with-a-long-random-secret"
 python -m uvicorn app.main:app --reload
 ```
 
-On Windows PowerShell use `.venv\Scripts\Activate.ps1` and `$env:SHOPSYNC_OWNER_TOKEN="replace-this-with-a-long-random-secret"` instead of the `source` and `export` lines.
+On Windows PowerShell, run these commands inside the `shopsync-uc4` folder:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+$env:SHOPSYNC_OWNER_TOKEN="replace-this-with-a-long-random-secret"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+The project requires Pydantic 2.12 or newer because its `TypeAdapter` and `model_dump()` APIs are used by the app and FastAPI. If an existing Windows environment reports `ImportError: cannot import name 'TypeAdapter'`, run `.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt` and restart the server.
 
 Open **http://127.0.0.1:8000/**. Enter the owner token from the terminal command. Add a product on **Catalog**, then create an order on **Orders**. The **Chat simulator** lets you try the customer flow before connecting WhatsApp. API documentation is at **http://127.0.0.1:8000/docs**. The database is created at `data/shopsync.sqlite3`; set `SHOPSYNC_DB` to change its location.
 
 ## Demonstration flow
 
 1. Add SKU `TEE-01`, price `1500.00` PKR and stock `2`.
-2. In Chat simulator, use phone `923001234567` and send `ORDER TEE-01 1 | 12 Main Street, Lahore`.
-3. Copy the draft ID from the reply and send `CONFIRM ID` with that ID. Check that stock becomes `1` and the order has a recorded risk score.
+2. In Chat simulator, use phone `923001234567` and send `ORDER TEE-01 1 | 12 Main Street, Lahore | COD`. You can use `BANK_TRANSFER` instead of `COD`. The draft reply shows the customer's details, item price and quantity, delivery address, payment method, and total **before** confirmation.
+3. Review the summary. Copy its draft ID and send `CONFIRM ID` with that ID. Check that stock becomes `1` and the order has a recorded risk score.
 4. Send `STATUS ID`, then `CANCEL ID`; stock returns to `2` and a cancellation reverses the booked sale.
 5. To demonstrate risk review, start the server with `SHOPSYNC_RISK_AMOUNT_CENTS=100000` (PKR 1000). Place a PKR 1500 order and confirm it. It stays on hold until the owner approves; stock is checked again at approval time.
 6. To demonstrate a return, confirm and mark an order shipped, send `RETURN ID Wrong size` from the same customer number, approve the request, and then select **Item accepted**. Stock is restored only at that final step.
 
-Commands are `ORDER SKU QTY | address`, `EDIT ID SKU QTY | address`, `CONFIRM ID`, `STATUS ID`, `CANCEL ID`, `RETURN ID reason`, and `REFUND ID reason`. The simulator accepts one SKU per order and uses cash on delivery. The owner API supports several distinct products in one order.
+Commands are `ORDER SKU QTY | address | COD`, `EDIT ID SKU QTY | address | BANK_TRANSFER`, `CONFIRM ID`, `STATUS ID`, `CANCEL ID`, `RETURN ID reason`, and `REFUND ID reason`. Both order commands accept either `COD` or `BANK_TRANSFER`, and an omitted payment choice asks the customer to provide one. Editing a draft displays a fresh full summary. The simulator accepts one SKU per order; the owner API supports several distinct products in one order.
 
 ## Order rules
 
@@ -43,6 +66,8 @@ Commands are `ORDER SKU QTY | address`, `EDIT ID SKU QTY | address`, `CONFIRM ID
 | Approve a refund request | `COMPLETED` | Book a refund adjustment; owner handles actual payment |
 | Approve a return request | `APPROVED_AWAITING_RECEIPT` | No change until inspection |
 | Accept returned item | `COMPLETED` | Restore full-order stock and book refund adjustment once |
+
+The owner must enter a reason to reject a return or refund request or a returned item during inspection. The reason is saved in the request record, included in the customer notification for a live WhatsApp order, and available through the customer's `STATUS ID` command in the simulator.
 
 Order item names and prices are stored as snapshots. Stock never becomes negative. A database transaction groups order confirmation with stock and booked-sale changes. A source key makes draft creation idempotent; status transitions and unique stock/finance records prevent duplicate changes. Signed incoming WhatsApp messages are deduplicated by message ID. The audit history records order and approval decisions.
 
@@ -70,7 +95,7 @@ Owner endpoints require `Authorization: Bearer <SHOPSYNC_OWNER_TOKEN>`.
 
 - `POST /api/products`, `GET /api/products`, `POST /api/products/{id}/restock` — small catalog needed for orders.
 - `POST /api/orders/drafts` — create an order; provide a unique `source_key` for retries.
-- `PATCH /api/orders/{id}/draft` — edit a draft's products, quantities or address.
+- `PATCH /api/orders/{id}/draft` — edit a draft's products, quantities, address, or payment method.
 - `POST /api/orders/{id}/confirm`, `/risk-decision`, `/cancel`, `/ship` — order transitions.
 - `POST /api/orders/{id}/returns` — request a full-order return or refund.
 - `POST /api/returns/{id}/decision`, `/inspect` — owner decisions and item receipt.
@@ -97,7 +122,7 @@ Example owner-created draft (the product ID comes from `GET /api/products`):
 python -m unittest discover -s tests -v
 ```
 
-The tests cover owner authorization, repeat requests, risk holds, stock rechecks, competing confirmations for the last item, cancellations, returns, customer isolation in chat, and signed webhook deduplication.
+The tests cover owner authorization, repeat requests, risk holds, stock rechecks, competing confirmations for the last item, cancellations, returns, customer isolation in chat, signed webhook deduplication, payment selection, full draft summaries, and required rejection reasons.
 
 ## Project boundaries
 

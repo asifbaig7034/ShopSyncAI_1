@@ -43,7 +43,7 @@ function orderCard(o){
   if(['CONFIRMED','SHIPPED'].includes(o.status)&&!ret)actions.push(['return','Request return'],['refund','Request refund']);
   if(ret?.status==='PENDING')actions.push(['approve-return','Approve '+ret.kind.toLowerCase()],['reject-return','Reject request']);
   if(ret?.status==='APPROVED_AWAITING_RECEIPT')actions.push(['accept-item','Item accepted'],['reject-item','Item rejected']);
-  return `<article class="order-card"><div class="order-top"><div><strong>#${escapeHtml(o.id)}</strong><div class="order-meta">${escapeHtml(o.customer_name)} · ${escapeHtml(o.customer_phone)} · ${escapeHtml(o.channel)} · ${escapeHtml(o.created_at)}</div></div><span class="badge ${escapeHtml(o.status)}">${escapeHtml(o.status.replaceAll('_',' '))}</span></div><div class="order-items">${o.items.map(i=>`${i.quantity} × ${escapeHtml(i.name)} (${escapeHtml(i.sku)})`).join(', ')} · <strong>${money(o.total_cents)}</strong></div>${o.risk_score!==null?`<div class="subdetail">Risk review: ${o.risk_score}/100 · ${o.risk_reasons.map(escapeHtml).join('; ')}</div>`:''}${ret?`<div class="subdetail">${escapeHtml(ret.kind)} request: ${escapeHtml(ret.status.replaceAll('_',' '))} · ${escapeHtml(ret.reason)}</div>`:''}<div class="actions">${actions.map(([action,label])=>`<button data-action="${action}" data-id="${escapeHtml(o.id)}">${label}</button>`).join('')}</div></article>`;
+  return `<article class="order-card"><div class="order-top"><div><strong>#${escapeHtml(o.id)}</strong><div class="order-meta">${escapeHtml(o.customer_name)} · ${escapeHtml(o.customer_phone)} · ${escapeHtml(o.channel)} · ${escapeHtml(o.created_at)}</div></div><span class="badge ${escapeHtml(o.status)}">${escapeHtml(o.status.replaceAll('_',' '))}</span></div><div class="order-items">${o.items.map(i=>`${i.quantity} × ${escapeHtml(i.name)} (${escapeHtml(i.sku)})`).join(', ')} · <strong>${money(o.total_cents)}</strong></div><div class="subdetail">Delivery: ${escapeHtml(o.delivery_address)} · Payment: ${escapeHtml(o.payment_method)}</div>${o.risk_score!==null?`<div class="subdetail">Risk review: ${o.risk_score}/100 · ${o.risk_reasons.map(escapeHtml).join('; ')}</div>`:''}${ret?`<div class="subdetail">${escapeHtml(ret.kind)} request: ${escapeHtml(ret.status.replaceAll('_',' '))} · ${escapeHtml(ret.reason)}${ret.owner_reason?` · Owner reason: ${escapeHtml(ret.owner_reason)}`:''}</div>`:''}<div class="actions">${actions.map(([action,label])=>`<button data-action="${action}" data-id="${escapeHtml(o.id)}">${label}</button>`).join('')}</div></article>`;
 }
 
 $('connect').onclick=async()=>{token=$('token').value.trim();sessionStorage.setItem('shopsync_owner_token',token);await refresh();};
@@ -60,15 +60,17 @@ document.addEventListener('click',async e=>{let btn=e.target.closest('button[dat
     let selected=state.products.find(p=>p.sku===product.trim().toUpperCase());if(!selected)throw new Error('Unknown SKU.');
     let quantity=prompt('Quantity:',o.items[0].quantity);if(quantity===null)return;
     let address=prompt('Delivery address:',o.delivery_address);if(address===null)return;
-    btn.disabled=true;await api(`/api/orders/${id}/draft`,{method:'PATCH',body:JSON.stringify({items:[{product_id:selected.id,quantity:Number(quantity)}],delivery_address:address})});notice('Draft updated.');await refresh();return;
+    let payment=prompt('Payment method: COD or BANK_TRANSFER',o.payment_method);if(payment===null)return;
+    payment=payment.trim().toUpperCase();if(!['COD','BANK_TRANSFER'].includes(payment))throw new Error('Choose COD or BANK_TRANSFER.');
+    btn.disabled=true;await api(`/api/orders/${id}/draft`,{method:'PATCH',body:JSON.stringify({items:[{product_id:selected.id,quantity:Number(quantity)}],delivery_address:address,payment_method:payment})});notice('Draft updated.');await refresh();return;
   }
   else if(action==='confirm')path=`/api/orders/${id}/confirm`;
   else if(action==='cancel'){if(!confirm('Cancel this order?'))return;path=`/api/orders/${id}/cancel`;}
   else if(action==='ship')path=`/api/orders/${id}/ship`;
   else if(action==='approve-risk'||action==='reject-risk'){let reason=prompt('Decision note (optional):');if(reason===null)return;path=`/api/orders/${id}/risk-decision`;body={approve:action==='approve-risk',reason};}
   else if(action==='return'||action==='refund'){let reason=prompt('Customer reason for request:');if(!reason)return;path=`/api/orders/${id}/returns`;body={kind:action.toUpperCase(),reason};}
-  else if(action==='approve-return'||action==='reject-return'){let reason=prompt('Decision note:');if(reason===null)return;path=`/api/returns/${o.return_request.id}/decision`;body={approve:action==='approve-return',reason};}
-  else if(action==='accept-item'||action==='reject-item'){path=`/api/returns/${o.return_request.id}/inspect`;body={accept:action==='accept-item'};}
+  else if(action==='approve-return'||action==='reject-return'){let reason=prompt(action==='reject-return'?'Reason for rejection (required):':'Decision note (optional):');if(reason===null)return;if(action==='reject-return'&&!reason.trim())throw new Error('A rejection reason is required.');path=`/api/returns/${o.return_request.id}/decision`;body={approve:action==='approve-return',reason:reason.trim()};}
+  else if(action==='accept-item'||action==='reject-item'){let reason='';if(action==='reject-item'){let answer=prompt('Reason for rejecting returned item (required):');if(answer===null)return;if(!answer.trim())throw new Error('A rejection reason is required.');reason=answer.trim();}path=`/api/returns/${o.return_request.id}/inspect`;body={accept:action==='accept-item',reason};}
   if(!path)return;btn.disabled=true;await post(path,body);notice('Action saved.');await refresh();
 }catch(err){notice(err.message,true);}finally{btn.disabled=false;}});
 if(token)refresh();

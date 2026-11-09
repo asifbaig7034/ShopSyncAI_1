@@ -23,6 +23,30 @@ def uid():
     return uuid.uuid4().hex[:16].upper()
 
 
+def format_pkr(cents):
+    return f"PKR {cents // 100:,}.{cents % 100:02d}"
+
+
+def draft_summary(order):
+    """Show every detail the customer should review before confirming."""
+    lines = [
+        f"Draft {order['id']}",
+        f"Customer: {order['customer_name']} ({order['customer_phone']})",
+        "Items:",
+    ]
+    for item in order["items"]:
+        lines.append(f"- {item['quantity']} x {item['name']} ({item['sku']}) "
+                     f"at {format_pkr(item['unit_price_cents'])} = "
+                     f"{format_pkr(item['quantity'] * item['unit_price_cents'])}")
+    lines.extend([
+        f"Delivery address: {order['delivery_address']}",
+        f"Payment method: {order['payment_method']}",
+        f"Total: {format_pkr(order['total_cents'])}",
+        f"Reply CONFIRM {order['id']} if these details are correct.",
+    ])
+    return "\n".join(lines)
+
+
 def phone_number(value):
     phone = re.sub(r"\D", "", str(value))
     if not 8 <= len(phone) <= 15:
@@ -153,12 +177,15 @@ def create_draft(phone, name, items, delivery_address, payment_method, source_ke
                       "owner", source_key, "owner")
 
 
-def _edit_draft(db, order_id, items, address, actor, requester_phone=None):
+def _edit_draft(db, order_id, items, address, actor, requester_phone=None, payment_method=None):
     order = order_view(db, order_id, requester_phone)
     if order["status"] != "DRAFT":
         raise OrderError("Only a draft can be edited.", 409)
     if not address.strip() or len(address) > 500:
         raise OrderError("Provide a delivery address (maximum 500 characters).")
+    method = payment_method or order["payment_method"]
+    if method not in ("COD", "BANK_TRANSFER"):
+        raise OrderError("Payment method must be COD or BANK_TRANSFER.")
     if not items or len(items) > 25 or len({i["product_id"] for i in items}) != len(items):
         raise OrderError("Provide 1 to 25 distinct products.")
     resolved, total = [], 0
@@ -173,15 +200,15 @@ def _edit_draft(db, order_id, items, address, actor, requester_phone=None):
     for p, qty in resolved:
         db.execute("INSERT INTO order_items VALUES(?,?,?,?,?,?)",
                    (order_id, p["id"], p["sku"], p["name"], p["price_cents"], qty))
-    db.execute("UPDATE orders SET delivery_address=?,total_cents=?,updated_at=? WHERE id=?",
-               (address.strip(), total, now(), order_id))
+    db.execute("UPDATE orders SET delivery_address=?,payment_method=?,total_cents=?,updated_at=? WHERE id=?",
+               (address.strip(), method, total, now(), order_id))
     log(db, order_id, actor, "draft_edited", total_cents=total)
     return order_view(db, order_id)
 
 
-def edit_draft(order_id, items, address):
+def edit_draft(order_id, items, address, payment_method=None):
     with transaction() as db:
-        return _edit_draft(db, order_id, items, address, "owner")
+        return _edit_draft(db, order_id, items, address, "owner", payment_method=payment_method)
 
 
 def _risk(db, order):
@@ -258,7 +285,7 @@ def decide_risk(order_id, approve, reason):
         if order["channel"] == "whatsapp":
             queue_message(db, order["customer_phone"],
                           f"Order {order_id} {'confirmed' if approve else 'rejected after review'}." +
-                          (f" Reason: {reason.strip()[:200]}" if not approve and reason.strip() else ""))
+                          (f" Reason: {reason.strip()}" if not approve and reason.strip() else ""))
         return order_view(db, order_id)
 
 
@@ -348,6 +375,8 @@ def decide_return(request_id, approve, reason):
         order = order_view(db, row["order_id"])
         if row["status"] != "PENDING":
             return order
+        if not approve and not reason.strip():
+            raise OrderError("A rejection reason is required for a return or refund.")
         status = "REJECTED"
         if approve:
             status = "APPROVED_AWAITING_RECEIPT" if row["kind"] == "RETURN" else "COMPLETED"
@@ -359,11 +388,11 @@ def decide_return(request_id, approve, reason):
         if order["channel"] == "whatsapp":
             queue_message(db, order["customer_phone"],
                           f"Your {row['kind'].lower()} request for {order['id']} is {status.lower().replace('_',' ')}." +
-                          (f" Reason: {reason.strip()[:200]}" if not approve and reason.strip() else ""))
+                          (f" Reason: {reason.strip()}" if not approve else ""))
         return order_view(db, order["id"])
 
 
-def receive_return(request_id, accept):
+def receive_return(request_id, accept, reason=""):
     with transaction() as db:
         row = db.execute("SELECT * FROM return_requests WHERE id=?", (request_id,)).fetchone()
         if not row:
@@ -373,6 +402,8 @@ def receive_return(request_id, accept):
             return order
         if row["kind"] != "RETURN" or row["status"] != "APPROVED_AWAITING_RECEIPT":
             raise OrderError("Return is not awaiting item inspection.", 409)
+        if not accept and not reason.strip():
+            raise OrderError("A reason is required when rejecting a returned item.")
         if accept:
             for item in order["items"]:
                 db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
@@ -381,12 +412,13 @@ def receive_return(request_id, accept):
                            (uid(), order["id"], item["product_id"], "RETURN", item["quantity"], now()))
             _refund_entry(db, order)
         status = "COMPLETED" if accept else "REJECTED_AFTER_INSPECTION"
-        db.execute("UPDATE return_requests SET status=?,received_at=? WHERE id=?",
-                   (status, now(), request_id))
-        log(db, order["id"], "owner", "return_inspected", accepted=accept)
+        db.execute("UPDATE return_requests SET status=?,owner_reason=?,received_at=? WHERE id=?",
+                   (status, row["owner_reason"] if accept else reason.strip(), now(), request_id))
+        log(db, order["id"], "owner", "return_inspected", accepted=accept, reason=reason.strip())
         if order["channel"] == "whatsapp":
             queue_message(db, order["customer_phone"],
-                          f"Return for {order['id']} {status.lower().replace('_',' ')}.")
+                          f"Return for {order['id']} {status.lower().replace('_',' ')}." +
+                          (f" Reason: {reason.strip()}" if not accept else ""))
         return order_view(db, order["id"])
 
 
@@ -415,33 +447,36 @@ def chat(message_id, phone, text, name="", live=False):
         db.execute("SAVEPOINT chat_operation")
         try:
             if cmd == "ORDER":
-                match = re.fullmatch(r"ORDER\s+(\S+)\s+(\d+)\s*\|\s*(.+)", text.strip(), re.I | re.S)
+                match = re.fullmatch(r"ORDER\s+(\S+)\s+(\d+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)",
+                                     text.strip(), re.I | re.S)
                 if not match:
-                    raise OrderError("Use: ORDER SKU QUANTITY | delivery address")
-                sku, quantity, address = match.groups()
+                    raise OrderError("Choose payment method: ORDER SKU QUANTITY | delivery address | COD or BANK_TRANSFER")
+                sku, quantity, address, payment = match.groups()
                 if len(quantity) > 3:
                     raise OrderError("Quantity must be between 1 and 100.")
+                payment_method = payment.strip().upper().replace(" ", "_")
                 p = db.execute("SELECT id FROM products WHERE sku=? AND active=1", (sku.upper(),)).fetchone()
                 if not p:
                     raise OrderError("Unknown SKU. Ask the owner for the product code.", 404)
                 order = _draft(db, phone, name, [{"product_id": p["id"], "quantity": int(quantity)}],
-                               address, "COD", "whatsapp" if live else "simulation", "chat:" + message_id,
+                               address, payment_method, "whatsapp" if live else "simulation", "chat:" + message_id,
                                "customer")
-                reply = (f"Draft {order['id']}: {quantity} x {sku.upper()}, total PKR "
-                         f"{order['total_cents']/100:.2f}. Reply CONFIRM {order['id']} to place it.")
+                reply = draft_summary(order)
             elif cmd == "EDIT":
-                match = re.fullmatch(r"EDIT\s+(\S+)\s+(\S+)\s+(\d+)\s*\|\s*(.+)", text.strip(), re.I | re.S)
+                match = re.fullmatch(r"EDIT\s+(\S+)\s+(\S+)\s+(\d+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)",
+                                     text.strip(), re.I | re.S)
                 if not match:
-                    raise OrderError("Use: EDIT ORDER_ID SKU QUANTITY | delivery address")
-                order_id, sku, quantity, address = match.groups()
+                    raise OrderError("Use: EDIT ORDER_ID SKU QUANTITY | delivery address | COD or BANK_TRANSFER")
+                order_id, sku, quantity, address, payment = match.groups()
                 if len(quantity) > 3:
                     raise OrderError("Quantity must be between 1 and 100.")
                 p = db.execute("SELECT id FROM products WHERE sku=? AND active=1", (sku.upper(),)).fetchone()
                 if not p:
                     raise OrderError("Unknown SKU.", 404)
                 edited = _edit_draft(db, order_id.upper(), [{"product_id": p["id"], "quantity": int(quantity)}],
-                                     address, "customer", phone)
-                reply = f"Draft {edited['id']} updated. New total PKR {edited['total_cents']/100:.2f}. Reply CONFIRM {edited['id']}."
+                                     address, "customer", phone,
+                                     payment_method=payment.strip().upper().replace(" ", "_"))
+                reply = draft_summary(edited)
             elif cmd in ("CONFIRM", "STATUS", "CANCEL") and len(parts) >= 2:
                 order_id = parts[1].upper()
                 if cmd == "CONFIRM":
@@ -453,11 +488,17 @@ def chat(message_id, phone, text, name="", live=False):
                 reply = f"Order {order_id}: {order['status']}."
                 if order["status"] == "RISK_HOLD":
                     reply += " Awaiting owner review; no stock or sale has been recorded."
+                request = order["return_request"]
+                if request:
+                    reply += f" {request['kind'].title()} request: {request['status'].replace('_', ' ').lower()}."
+                    if request["status"] in ("REJECTED", "REJECTED_AFTER_INSPECTION") and request["owner_reason"]:
+                        reply += f" Reason: {request['owner_reason']}"
             elif cmd in ("RETURN", "REFUND") and len(parts) == 3:
                 order = _request_return(db, parts[1].upper(), cmd, parts[2], "customer", phone)
                 reply = f"{cmd.title()} request for {order['id']} recorded for owner review."
             else:
-                reply = ("Commands: ORDER SKU QTY | address; EDIT ORDER_ID SKU QTY | address; CONFIRM ORDER_ID; STATUS ORDER_ID; "
+                reply = ("Commands: ORDER SKU QTY | address | COD or BANK_TRANSFER; "
+                         "EDIT ORDER_ID SKU QTY | address | COD or BANK_TRANSFER; CONFIRM ORDER_ID; STATUS ORDER_ID; "
                          "CANCEL ORDER_ID; RETURN ORDER_ID reason; REFUND ORDER_ID reason.")
         except OrderError as exc:
             db.execute("ROLLBACK TO SAVEPOINT chat_operation")
