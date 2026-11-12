@@ -11,6 +11,10 @@ from .api.routes.demo_events import router as demo_events_router
 from .api.routes.account import router as account_router
 from .api.routes.integrations import router as integrations_router
 from .api.routes.owner_chat import router as owner_chat_router
+from .api.routes.conversations import router as conversations_router
+from .api.routes.whatsapp_webhook import router as whatsapp_webhook_router
+from .api.routes.products import router as products_router
+from .api.routes.orders import router as orders_router
 from .core.config import get_settings
 
 
@@ -29,6 +33,10 @@ def create_app(database: Any = None) -> FastAPI:
     application.include_router(integrations_router)
     application.include_router(owner_chat_router)
     application.include_router(demo_events_router)
+    application.include_router(products_router)
+    application.include_router(orders_router)
+    application.include_router(conversations_router)
+    application.include_router(whatsapp_webhook_router)
 
     @application.get("/api/health", tags=["System"])
     def health() -> dict:
