@@ -1,0 +1,45 @@
+services:
+  mongo:
+    image: mongo:8.0
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build: ./backend
+    environment:
+      STORAGE: mongo
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DATABASE: shopsync_uc3_demo
+      DEMO_MODE: "true"
+      CHANNEL: demo
+      BUSINESS_ID: ${BUSINESS_ID:-demo-business}
+      DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:-demo-owner-token}
+      CUSTOMER_AGENT_ENABLED: "true"
+      WHATSAPP_CONNECTED: "true"
+      LLM_PROVIDER: ${LLM_PROVIDER:-demo}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /api
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  mongo-data:
