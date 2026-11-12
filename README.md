@@ -1,5 +1,9 @@
 # ShopSync AI - UC-1 owner account and UC-2 orchestrator prototype
 
+The UC-3 customer inbox and UC-4 orders are being integrated with this owner
+app. See [the UC-3/UC-4 integration checkpoint](docs/uc3-uc4-integration.md)
+for the local demo flow and current limits.
+
 This repository implements **UC-2, Send Request to Orchestrator**, and the
 UC-1 owner-account flows (signup, login, logout, settings and password recovery). The Business Owner
 types a natural-language request into a small React chat. FastAPI checks an

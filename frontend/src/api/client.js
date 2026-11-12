@@ -102,3 +102,59 @@ export function sendOwnerRequest({ token, message, conversationId }) {
 export function getOwnerHistory({ token, conversationId }) {
   return request(`/api/owner/chat/history?conversation_id=${encodeURIComponent(conversationId)}`, token);
 }
+
+// Customer inbox (UC-3). All owner endpoints reuse the UC-1 session token.
+export function getConversations(token) {
+  return request('/api/conversations', token);
+}
+
+export function getConversation(token, conversationId) {
+  return request(`/api/conversations/${encodeURIComponent(conversationId)}`, token);
+}
+
+export function handoverConversation(token, conversationId, mode) {
+  return request(`/api/conversations/${encodeURIComponent(conversationId)}/handover`, token, {
+    method: 'POST', body: JSON.stringify({ mode }),
+  });
+}
+
+export function sendConversationReply(token, conversationId, body) {
+  return request(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, token, {
+    method: 'POST', body: JSON.stringify(body),
+  });
+}
+
+export function simulateCustomerMessage(token, body) {
+  return request('/api/demo/messages', token, { method: 'POST', body: JSON.stringify(body) });
+}
+
+// UC-4 preserves the validated standalone orders API, but uses UC-1 sessions.
+export function getOrderProducts(token) {
+  return request('/api/products', token);
+}
+
+export function addOrderProduct(token, body) {
+  return request('/api/products', token, { method: 'POST', body: JSON.stringify(body) });
+}
+
+export function addProductStock(token, productId, quantity) {
+  return request(`/api/products/${encodeURIComponent(productId)}/restock`, token, {
+    method: 'POST', body: JSON.stringify({ quantity }),
+  });
+}
+
+export function getOrders(token) {
+  return request('/api/orders', token);
+}
+
+export function createOrderDraft(token, body) {
+  return request('/api/orders/drafts', token, { method: 'POST', body: JSON.stringify(body) });
+}
+
+export function editOrderDraft(token, orderId, body) {
+  return request(`/api/orders/${encodeURIComponent(orderId)}/draft`, token, { method: 'PATCH', body: JSON.stringify(body) });
+}
+
+export function sendOrderAction(token, path, body = {}) {
+  return request(path, token, { method: 'POST', body: JSON.stringify(body) });
+}

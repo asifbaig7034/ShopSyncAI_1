@@ -13,9 +13,12 @@ from backend.app.main import create_app
 
 
 @pytest.fixture
-def demo(monkeypatch):
+def demo(monkeypatch, tmp_path):
     monkeypatch.setenv("DEMO_MODE", "true")
     monkeypatch.setenv("SHOPSYNC_DEMO_OWNER_TOKEN", "test-owner-token-only-for-local-testing")
+    # Never let an integration test create or read a developer's real order
+    # ledger from the configured .env or the repository's data/ directory.
+    monkeypatch.setenv("SHOPSYNC_DB", str(tmp_path / "orders.sqlite3"))
     # Override any real .env value: tests must never make paid or unpaid API calls.
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "")

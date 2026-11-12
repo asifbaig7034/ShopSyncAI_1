@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShopSync AI · Orders</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar"><div class="brand"><span class="mark">S</span><span>ShopSync <strong>AI</strong></span></div><span class="tag">UC-4 · Order workspace</span></header>
+  <main>
+    <section class="intro"><div><p class="eyebrow">OWNER WORKSPACE</p><h1>Orders, from request to resolution.</h1><p>Review incoming orders, keep stock accurate, and make decisions with a clear record of every change.</p></div><div class="auth"><label for="token">Owner token</label><div class="inline"><input id="token" type="password" placeholder="Enter SHOPSYNC_OWNER_TOKEN" autocomplete="off"><button id="connect" class="primary">Connect</button></div><small>Use the token you set when starting the server. It stays in this browser tab.</small></div></section>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <section class="metrics" aria-label="Order summary"><div><span>Orders</span><strong id="m-orders">—</strong></div><div><span>Awaiting review</span><strong id="m-holds">—</strong></div><div><span>Open returns</span><strong id="m-returns">—</strong></div><div><span>Booked net sales</span><strong id="m-sales">—</strong></div></section>
+    <nav class="tabs" aria-label="Sections"><button data-tab="orders" class="active">Orders</button><button data-tab="catalog">Catalog</button><button data-tab="chat">Chat simulator</button><button data-tab="activity">Activity</button></nav>
+    <section id="orders" class="tab-panel">
+      <div class="section-head"><div><p class="eyebrow">ORDER MANAGEMENT</p><h2>Orders</h2></div><button id="refresh" class="quiet">Refresh</button></div>
+      <div class="grid"><form id="draft-form" class="card"><h3>Create an order draft</h3><p>Enter the details, then confirm the draft after the customer agrees.</p><label>Customer name<input name="name" required maxlength="100" placeholder="Ayesha"></label><label>Phone including country code<input name="phone" required placeholder="923001234567"></label><label>Product<select name="product_id" id="product-select" required><option value="">Add a product first</option></select></label><div class="twocol"><label>Quantity<input name="quantity" type="number" min="1" max="100" value="1" required></label><label>Payment<select name="payment_method"><option value="COD">Cash on delivery</option><option value="BANK_TRANSFER">Bank transfer</option></select></label></div><label>Delivery address<textarea name="delivery_address" required maxlength="500" rows="2"></textarea></label><button class="primary" type="submit">Create draft</button></form>
+      <div class="card wide"><div class="card-head"><h3>All orders</h3><span id="order-count" class="muted"></span></div><div id="order-list" class="list"><p class="empty">Connect to load orders.</p></div></div></div>
+    </section>
+    <section id="catalog" class="tab-panel" hidden><div class="section-head"><div><p class="eyebrow">PRODUCT DATA</p><h2>Catalog and stock</h2></div></div><div class="grid"><form id="product-form" class="card"><h3>Add a product</h3><p>Only the product fields needed for UC-4 are included here.</p><label>SKU<input name="sku" required maxlength="32" placeholder="TEE-01"></label><label>Name<input name="name" required maxlength="100" placeholder="Cotton shirt"></label><div class="twocol"><label>Price (PKR)<input name="price" type="number" step="0.01" min="0" required></label><label>Stock<input name="stock_qty" type="number" min="0" required></label></div><button class="primary">Add product</button></form><div class="card wide"><h3>Products</h3><div id="product-list" class="list"><p class="empty">Connect to load products.</p></div></div></div></section>
+    <section id="chat" class="tab-panel" hidden><div class="section-head"><div><p class="eyebrow">TEST WITHOUT AN EXTERNAL ACCOUNT</p><h2>Customer chat simulator</h2></div></div><div class="grid"><form id="chat-form" class="card"><h3>Send a customer command</h3><label>Customer phone<input name="phone" required placeholder="923001234567"></label><label>Customer name<input name="name" placeholder="Ayesha"></label><label>Message<textarea name="text" required rows="3" placeholder="ORDER TEE-01 2 | 12 Main Street, Lahore | COD"></textarea></label><button class="primary">Send simulated message</button><p class="hint">Commands: <code>ORDER SKU QTY | address | COD</code> (or <code>BANK_TRANSFER</code>), <code>EDIT ID SKU QTY | address | COD</code>, <code>CONFIRM ID</code>, <code>STATUS ID</code>, <code>CANCEL ID</code>, <code>RETURN ID reason</code>, <code>REFUND ID reason</code>. Choose COD or BANK_TRANSFER in each order.</p></form><div class="card wide"><h3>Conversation</h3><div id="chat-log" class="conversation"><p class="empty">No simulated messages yet.</p></div></div></div></section>
+    <section id="activity" class="tab-panel" hidden><div class="section-head"><div><p class="eyebrow">TRACEABILITY</p><h2>Activity</h2></div></div><div class="grid"><div class="card wide"><h3>Delivery notifications</h3><p>Live WhatsApp messages wait here if credentials or an approved template are needed.</p><div id="notifications" class="list"></div></div><div class="card"><h3>Audit history</h3><div id="audit" class="list"></div></div></div></section>
+    <footer>ShopSync AI · UC-4 demonstrator · Financial entries track order bookings; payment settlement remains a separate integration.</footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

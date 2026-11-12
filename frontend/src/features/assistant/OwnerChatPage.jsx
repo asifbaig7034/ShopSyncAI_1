@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { getOwnerHistory, sendOwnerRequest } from '../../api/client.js';
 import SettingsPanel from '../setup/SettingsPanel.jsx';
+import ConversationsPage from '../inbox/ConversationsPage.jsx';
+import OrdersPage from '../orders/OrdersPage.jsx';
 
 const conversationKey = (ownerId) => `shopsync-uc2-conversation-id:${ownerId}`;
 const EXAMPLES = [
@@ -62,6 +64,7 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [notice, setNotice] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [page, setPage] = useState('assistant');
   const [savingSettings, setSavingSettings] = useState(false);
   const bottomRef = useRef(null);
   const justCreatedConversation = useRef('');
@@ -102,6 +105,11 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
     setMessages([]);
     setMessage('');
     setNotice('');
+  }
+
+  function navigate(next) {
+    setPage(next);
+    setSettingsOpen(false);
   }
 
   async function send(event) {
@@ -146,10 +154,15 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
       </header>
 
       <main className="workspace">
+        <nav className="workspace-tabs" aria-label="Owner workspace navigation">
+          <button type="button" aria-current={page === 'assistant' ? 'page' : undefined} onClick={() => navigate('assistant')}>Owner chat</button>
+          <button type="button" aria-current={page === 'inbox' ? 'page' : undefined} onClick={() => navigate('inbox')}>Customer inbox</button>
+          <button type="button" aria-current={page === 'orders' ? 'page' : undefined} onClick={() => navigate('orders')}>Orders</button>
+        </nav>
         <section className="intro" aria-labelledby="page-title">
-          <div className="eyebrow">{settingsOpen ? 'OWNER SETTINGS' : 'AGENT ORCHESTRATION'}</div>
-          <h1 id="page-title">{settingsOpen ? 'Set up your brand.' : 'Ask your business a question.'}</h1>
-          <p>{settingsOpen ? 'Update your business profile and choose the agents available to answer owner requests.' : 'Your request is routed to available agent handlers, and their results come back in one answer.'}</p>
+          <div className="eyebrow">{settingsOpen ? 'OWNER SETTINGS' : page === 'inbox' ? 'CUSTOMER CONVERSATIONS' : page === 'orders' ? 'ORDER MANAGEMENT' : 'AGENT ORCHESTRATION'}</div>
+          <h1 id="page-title">{settingsOpen ? 'Set up your brand.' : page === 'inbox' ? 'Talk with your customers.' : page === 'orders' ? 'Manage your orders.' : 'Ask your business a question.'}</h1>
+          <p>{settingsOpen ? 'Update your business profile and choose the agents available to answer owner requests.' : page === 'inbox' ? 'See customer messages, take over a conversation and try the local simulator.' : page === 'orders' ? 'Create products and orders, check risk holds and review return requests.' : 'Your request is routed to available agent handlers, and their results come back in one answer.'}</p>
         </section>
 
         <div className="workspace-grid">
@@ -171,13 +184,13 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
 
           <section className="chat-panel" aria-label="Owner chat">
             <div className="chat-header">
-              <div><div className="panel-label">{settingsOpen ? 'ACCOUNT SETUP' : 'OWNER CHAT'}</div><h2>{settingsOpen ? 'Settings' : 'Orchestrator'}</h2></div>
+              <div><div className="panel-label">{settingsOpen ? 'ACCOUNT SETUP' : page === 'inbox' ? 'CUSTOMER SUPPORT' : page === 'orders' ? 'COMMERCE' : 'OWNER CHAT'}</div><h2>{settingsOpen ? 'Settings' : page === 'inbox' ? 'Inbox' : page === 'orders' ? 'Orders' : 'Orchestrator'}</h2></div>
               <div className="chat-header__actions">
-                <button className="button button--quiet" type="button" onClick={() => setSettingsOpen(!settingsOpen)} disabled={busy || savingSettings}>{settingsOpen ? 'Back to chat' : 'Settings'}</button>
-                {!settingsOpen && <button className="button button--quiet" type="button" onClick={resetConversation} disabled={busy}>New chat</button>}
+                <button className="button button--quiet" type="button" onClick={() => setSettingsOpen(!settingsOpen)} disabled={busy || savingSettings}>{settingsOpen ? 'Back to workspace' : 'Settings'}</button>
+                {!settingsOpen && page === 'assistant' && <button className="button button--quiet" type="button" onClick={resetConversation} disabled={busy}>New chat</button>}
               </div>
             </div>
-            {settingsOpen ? <SettingsPanel token={token} onProfileSaved={onProfileSaved} onSavingChange={setSavingSettings} /> : <>
+            {settingsOpen ? <SettingsPanel token={token} onProfileSaved={onProfileSaved} onSavingChange={setSavingSettings} /> : page === 'inbox' ? <ConversationsPage token={token} /> : page === 'orders' ? <OrdersPage token={token} /> : <>
               {notice && <div className="notice" role="alert">{notice}</div>}
               <div className="chat-messages" aria-live="polite" aria-busy={busy || loadingHistory}>
               {loadingHistory && <div className="loading">Loading saved conversation…</div>}

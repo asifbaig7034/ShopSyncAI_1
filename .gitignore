@@ -9,6 +9,8 @@ __pycache__/
 .env
 .env.*.local
 *.sqlite3
+*.sqlite3-*
+data/
 
 # Node / Vite
 node_modules/
