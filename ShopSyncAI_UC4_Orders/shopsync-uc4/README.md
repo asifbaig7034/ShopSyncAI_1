@@ -1,131 +1,142 @@
-# ShopSync AI — UC-4 Manage Orders
+# ShopSync AI UC-4 Manage Orders with MongoDB
 
-A runnable implementation of the **Manage Orders** use case in the ShopSync AI FYP specification. It includes an owner workspace, an order API, a customer-command simulator, optional Meta WhatsApp Cloud API webhooks and text replies, a SQLite database, and automated order-integrity tests. No AI service or payment credentials are needed for the local demonstration.
+UC-4 is a separately runnable order module using **Python, FastAPI and MongoDB through PyMongo**. Products, customers, orders, stock movements, refund records, audit events and notifications now use MongoDB. SQLite is used only by the optional read-only importer for your older demo database.
 
-See [PROGRESS.md](PROGRESS.md) for the current UC-4 requirement checklist, tests, and integration handoffs.
+**Start with [SETUP_WINDOWS.md](SETUP_WINDOWS.md).** It explains how to keep the same working folder and environment, connect MongoDB and preserve previous orders. [PROGRESS.md](PROGRESS.md) records verified and pending work. [MONGODB_SCHEMA.md](MONGODB_SCHEMA.md) describes collections and IDs for integration.
 
-## Update your existing folder (Windows)
+Requires Python 3.10+ and a transaction-capable MongoDB deployment. On a fresh Git clone without an environment, run `py -3 -m venv .venv` once before installing requirements. An existing working folder reuses its current environment.
 
-Keep using your current `ShopSyncAI_UC4_Orders/shopsync-uc4` folder. To apply the companion **code-only update ZIP**, stop the server with Ctrl+C, extract the ZIP, then copy its `app`, `static`, and `tests` directories and `README.md`, `PROGRESS.md`, and `requirements.txt` into the same existing `shopsync-uc4` directory. Accept replacement of the code files. The update ZIP does **not** contain `data` or `.venv`, so your orders/products and existing Python environment stay in place. The full updated archive is supplied separately as a backup and retains the attached database and environment.
+## Update the same folder
 
-This update adds an explicit Pydantic dependency. From your existing `shopsync-uc4` directory, run the following **once after applying this update** (keep the existing `.venv`):
+Stop Uvicorn with Ctrl+C. Copy updated code into the existing team-repository shopsync-uc4 folder and replace code files. Keep the existing .venv, .env and data directory. Install the new MongoDB dependencies once:
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
-```
+    .\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
 
-Then set `SHOPSYNC_OWNER_TOKEN` in the current PowerShell terminal and start Uvicorn using the commands below. Future code-only updates do not need a new environment; install packages again only when `requirements.txt` changes. The `.gitignore` excludes `data/` and `.venv/` from Git; check `git status` before committing the UC-4 code on your own branch.
+Copy .env.example to .env only if .env does not already exist. Configure the connection as described in the Windows guide. Existing shell variables take precedence over .env.
 
-## Start in five minutes
+## MongoDB connection
 
-Requirements: Python 3.10+ and `pip`.
+Multi-document transactions are required: use an Atlas cluster, a replica set, or a sharded cluster. A plain standalone MongoDB server is rejected at startup because order confirmation must save order, stock and sale changes together.
 
-```bash
-cd shopsync-uc4
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export SHOPSYNC_OWNER_TOKEN="replace-this-with-a-long-random-secret"
-python -m uvicorn app.main:app --reload
-```
+For Atlas, put the driver's connection string from your own cluster into .env:
 
-On Windows PowerShell, run these commands inside the `shopsync-uc4` folder:
+    MONGODB_URI="mongodb+srv://DB_USER:ENCODED_PASSWORD@YOUR_CLUSTER_HOST/?retryWrites=true&w=majority"
+    MONGODB_DB="shopsync_uc4"
+    SHOPSYNC_OWNER_TOKEN="my-local-project-token"
 
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:SHOPSYNC_OWNER_TOKEN="replace-this-with-a-long-random-secret"
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
-```
+The placeholder URI is not a working account. Follow the Windows guide for database-user and network-access setup.
 
-The project requires Pydantic 2.12 or newer because its `TypeAdapter` and `model_dump()` APIs are used by the app and FastAPI. If an existing Windows environment reports `ImportError: cannot import name 'TypeAdapter'`, run `.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt` and restart the server.
+If Docker is already installed, the bundled Compose file runs a local development replica set:
 
-Open **http://127.0.0.1:8000/**. Enter the owner token from the terminal command. Add a product on **Catalog**, then create an order on **Orders**. The **Chat simulator** lets you try the customer flow before connecting WhatsApp. API documentation is at **http://127.0.0.1:8000/docs**. The database is created at `data/shopsync.sqlite3`; set `SHOPSYNC_DB` to change its location.
+    docker compose up -d --wait
 
-## Demonstration flow
+Use the local URI from .env.example:
 
-1. Add SKU `TEE-01`, price `1500.00` PKR and stock `2`.
-2. In Chat simulator, use phone `923001234567` and send `ORDER TEE-01 1 | 12 Main Street, Lahore | COD`. You can use `BANK_TRANSFER` instead of `COD`. The draft reply shows the customer's details, item price and quantity, delivery address, payment method, and total **before** confirmation.
-3. Review the summary. Copy its draft ID and send `CONFIRM ID` with that ID. Check that stock becomes `1` and the order has a recorded risk score.
-4. Send `STATUS ID`, then `CANCEL ID`; stock returns to `2` and a cancellation reverses the booked sale.
-5. To demonstrate risk review, start the server with `SHOPSYNC_RISK_AMOUNT_CENTS=100000` (PKR 1000). Place a PKR 1500 order and confirm it. It stays on hold until the owner approves; stock is checked again at approval time.
-6. To demonstrate a return, confirm and mark an order shipped, send `RETURN ID Wrong size` from the same customer number, approve the request, and then select **Item accepted**. Stock is restored only at that final step.
+    MONGODB_URI="mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true"
 
-Commands are `ORDER SKU QTY | address | COD`, `EDIT ID SKU QTY | address | BANK_TRANSFER`, `CONFIRM ID`, `STATUS ID`, `CANCEL ID`, `RETURN ID reason`, and `REFUND ID reason`. Both order commands accept either `COD` or `BANK_TRANSFER`, and an omitted payment choice asks the customer to provide one. Editing a draft displays a fresh full summary. The simulator accepts one SKU per order; the owner API supports several distinct products in one order.
+The named Docker volume retains data across restarts. Do not use docker compose down -v when you want to retain it. Compass can inspect MongoDB; installing Compass alone does not run a database server.
 
-## Order rules
+## Check the MongoDB connection
 
-| Event | Result | Stock and finance |
+After configuring .env, run:
+
+    .\.venv\Scripts\python.exe -m scripts.check_mongodb
+
+This checks connection, required indexes and a real transaction, then prints product/customer/order counts. Resolve connection/setup errors before importing old data or starting Uvicorn.
+
+## Previous SQLite records
+
+Stop the old app and back up its data folder. Preview:
+
+    .\.venv\Scripts\python.exe -m scripts.migrate_sqlite data/shopsync.sqlite3
+
+If preview counts are correct, import into an **empty** target UC-4 database:
+
+    .\.venv\Scripts\python.exe -m scripts.migrate_sqlite data/shopsync.sqlite3 --apply
+
+The importer opens SQLite read-only, preserves IDs/stock/state/history, embeds order items and commits all records in one MongoDB transaction. It refuses populated target collections. A repeated import is a verified no-op only while both source and imported target remain unchanged; it is not synchronization. For a fresh demonstration, skip import and add products after startup.
+
+## Start the app
+
+From the existing shopsync-uc4 folder:
+
+    .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+
+Open http://127.0.0.1:8000/. Enter SHOPSYNC_OWNER_TOKEN from .env in the owner-token box and select Connect. Keep the terminal open. API docs are at http://127.0.0.1:8000/docs. The /api/health endpoint identifies the backend as mongodb.
+
+On Linux/macOS, activate the existing environment and run equivalent python -m pip and python -m uvicorn commands.
+
+## Demonstration
+
+1. Add SKU TEE-01, name Demo Shirt, price 1500.00 PKR and stock 3 on Catalog. Use a new SKU if it exists.
+2. In Chat simulator, use phone 923001234567, name Ayesha, and send:
+
+       ORDER TEE-01 1 | 12 Main Street, Lahore | BANK_TRANSFER
+
+3. Review customer, item/quantity/price, address, payment and total in the reply. Omitting the payment choice asks for one instead of creating a draft.
+4. Copy the actual ID and send:
+
+       EDIT ID TEE-01 1 | 15 Main Street, Lahore | COD
+
+5. Send CONFIRM ID. A low-risk order becomes CONFIRMED, stock decreases once and a sale is recorded. Repeated confirmation does not deduct again.
+6. Send CANCEL ID before shipment. Stock and booked sale are reversed once.
+7. On a different confirmed order, send REFUND ID Wrong item. Reject with a reason or approve on Orders. Empty rejection reasons are refused. STATUS ID from the same customer shows the decision/reason.
+8. For a return, mark another order shipped, send RETURN ID Wrong size, approve, then accept or reject the received item. Stock returns only after acceptance; rejecting an item also requires a reason.
+
+An active/completed return or refund prevents cancellation from reversing the same sale again. Actual bank/gateway transfer remains manual.
+
+The simulator accepts one SKU per order. The owner API supports 1–25 distinct products. Commands are ORDER, EDIT, CONFIRM, STATUS, CANCEL, RETURN and REFUND using the formats shown in the screen.
+
+## Risk and eligibility
+
+Default rules: total at least PKR 20,000 adds 60 points; six or more items adds 25; two previous cancellations adds 25. Score 50 or greater holds an order. Approval rechecks current stock.
+
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| Create or edit draft | `DRAFT` | No change |
-| Confirm with low review score | `CONFIRMED` | Deduct stock and book sale atomically |
-| Confirm with high review score | `RISK_HOLD` | No change until owner approval |
-| Approve held order | `CONFIRMED`, after checking stock again | Deduct stock and book sale atomically |
-| Reject held order | `REJECTED` | No change |
-| Cancel an unshipped confirmed order | `CANCELLED` | Restore stock and reverse booked sale once |
-| Approve a refund request | `COMPLETED` | Book a refund adjustment; owner handles actual payment |
-| Approve a return request | `APPROVED_AWAITING_RECEIPT` | No change until inspection |
-| Accept returned item | `COMPLETED` | Restore full-order stock and book refund adjustment once |
+| SHOPSYNC_RISK_AMOUNT_CENTS | 2000000 | Amount rule, in integer minor units |
+| SHOPSYNC_RISK_THRESHOLD | 50 | Risk-hold score |
+| SHOPSYNC_RETURN_DAYS | 14 | Full-order request window |
 
-The owner must enter a reason to reject a return or refund request or a returned item during inspection. The reason is saved in the request record, included in the customer notification for a live WhatsApp order, and available through the customer's `STATUS ID` command in the simulator.
+For a risk demo set amount to 100000 in .env and restart. A PKR 1500 order should stay on hold with no stock/sale booking until approval. Restore 2000000 afterward. The return window starts at shipment for shipped orders, otherwise at creation.
 
-Order item names and prices are stored as snapshots. Stock never becomes negative. A database transaction groups order confirmation with stock and booked-sale changes. A source key makes draft creation idempotent; status transitions and unique stock/finance records prevent duplicate changes. Signed incoming WhatsApp messages are deduplicated by message ID. The audit history records order and approval decisions.
+## Tests
 
-The risk score is a transparent **review indicator**, not a fraud diagnosis. Default rules: total at least PKR 20,000 adds 60 points; six or more items adds 25; two previous cancellations adds 25. A score of 50 or greater holds the order. Configure `SHOPSYNC_RISK_AMOUNT_CENTS`, `SHOPSYNC_RISK_THRESHOLD`, and `SHOPSYNC_RETURN_DAYS` (default 14) through environment variables. The request window starts at shipment for shipped orders, otherwise at order creation.
+    .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
-## Optional WhatsApp Cloud API connection
+The generation run passed **16 offline domain checks and 6 offline migration checks**. These do not prove MongoDB transaction behavior. Real integration tests are explicitly skipped when TEST_MONGODB_URI is unset. To verify a real deployment, set that variable to a development replica-set/Atlas URI and run:
 
-Configure a Meta app, WhatsApp Business Account, business phone number and webhook subscription. Set these values on the server:
+    .\.venv\Scripts\python.exe -m scripts.run_mongo_tests
 
-```bash
-export WA_ACCESS_TOKEN="your-system-user-access-token"
-export WA_PHONE_NUMBER_ID="your-numeric-phone-number-id"
-export WA_GRAPH_VERSION="your-supported-graph-api-version"
-export WA_APP_SECRET="your-meta-app-secret"
-export WA_VERIFY_TOKEN="your-private-webhook-verification-token"
-```
+The runner requires a configured URI, refuses a result containing skipped tests and uses temporary test databases. The live suite currently contains 25 order/API cases plus 2 migration cases, including concurrent confirmation, cancellation/refund races and delivery leases. Use a development test user permitted to create/drop those databases.
 
-Register `GET/POST https://YOUR_PUBLIC_HOST/webhooks/whatsapp` as the webhook callback. Subscribe to incoming messages. GET checks the verification token; POST verifies `X-Hub-Signature-256` with the Meta app secret. The adapter accepts text commands from the sender's WhatsApp number and stores its reply in a delivery outbox. Successful outbound messages use Meta's `/{phone-number-id}/messages` endpoint. Failed sends are retried up to five times, then require owner review. A send interrupted mid-request is marked **UNCERTAIN**, for manual inspection before retrying.
+**Live MongoDB integration tests were not executed in the generation environment:** MongoDB/PyMongo were unavailable and downloads were blocked. The old SQLite version's 13 passing tests are historical, not proof of MongoDB concurrency or live WhatsApp delivery. Current evidence is recorded in PROGRESS.md.
 
-Free-form text replies are limited to an open customer-service window. When an owner decision occurs outside that window, the outbox marks the message **NEEDS_TEMPLATE** instead of attempting an invalid text send. Create an approved template and connect its delivery in a later integration milestone. WhatsApp setup, credentials, a publicly reachable deployment, permissions, and template approval cannot be supplied by this archive. See [Meta's official Cloud API collection](https://www.postman.com/meta/whatsapp-business-platform/documentation/wlk6lh4/whatsapp-cloud-api) and [WhatsApp's business messaging policy](https://whatsappbusiness.com/policy/) for account setup and message-window rules.
+## Optional WhatsApp
+
+Configure WA_ACCESS_TOKEN, WA_PHONE_NUMBER_ID, WA_GRAPH_VERSION, WA_APP_SECRET and WA_VERIFY_TOKEN on the server. No provider credentials are included.
+
+Register GET/POST https://YOUR_PUBLIC_HOST/webhooks/whatsapp. POST verifies X-Hub-Signature-256. Inbound IDs are deduplicated and checked against sender identity. The MongoDB outbox claims a lease, sends outside the order transaction and records status/retries. Ambiguous/interrupted sends become UNCERTAIN for review. Approved-template delivery outside the customer service window remains an integration handoff.
 
 ## API map
 
-Owner endpoints require `Authorization: Bearer <SHOPSYNC_OWNER_TOKEN>`.
+Owner endpoints currently require Authorization: Bearer followed by SHOPSYNC_OWNER_TOKEN.
 
-- `POST /api/products`, `GET /api/products`, `POST /api/products/{id}/restock` — small catalog needed for orders.
-- `POST /api/orders/drafts` — create an order; provide a unique `source_key` for retries.
-- `PATCH /api/orders/{id}/draft` — edit a draft's products, quantities, address, or payment method.
-- `POST /api/orders/{id}/confirm`, `/risk-decision`, `/cancel`, `/ship` — order transitions.
-- `POST /api/orders/{id}/returns` — request a full-order return or refund.
-- `POST /api/returns/{id}/decision`, `/inspect` — owner decisions and item receipt.
-- `GET /api/orders`, `/api/orders/{id}`, `/api/finance`, `/api/audit`, `/api/notifications` — owner views.
-- `POST /api/chat/simulate` — locally authenticated simulation; accepts a unique `message_id`.
-- `GET/POST /webhooks/whatsapp` — optional Meta verification and signed inbound messages.
+- GET/POST /api/products; POST /api/products/{id}/restock
+- GET /api/orders; GET /api/orders/{id}
+- POST /api/orders/drafts; PATCH /api/orders/{id}/draft
+- POST /api/orders/{id}/confirm, /risk-decision, /cancel, /ship
+- POST /api/orders/{id}/returns with kind RETURN or REFUND
+- POST /api/returns/{id}/decision, /inspect
+- GET /api/finance, /api/audit, /api/notifications
+- POST /api/notifications/{id}/retry; POST /api/chat/simulate
+- GET/POST /webhooks/whatsapp; GET /api/health
 
-Example owner-created draft (the product ID comes from `GET /api/products`):
+Money uses integer minor units: PKR 1500 is 150000 cents. Entity IDs are strings. See MONGODB_SCHEMA.md before connecting other modules.
 
-```json
-{
-  "phone": "923001234567",
-  "name": "Ayesha",
-  "delivery_address": "12 Main Street, Lahore",
-  "payment_method": "COD",
-  "items": [{"product_id": "PRODUCT_ID", "quantity": 1}],
-  "source_key": "your-unique-client-request-id"
-}
-```
+## Team boundaries
 
-## Run tests
+This remains a single-business UC-4 prototype. The local HTML/CSS/JavaScript screen tests the API; the team's React dashboard still needs connecting. UC-1 supplies actual login/permissions and business settings; UC-2 routes owner requests; UC-3 supplies natural-language operations and trusted sender identity.
 
-```bash
-python -m unittest discover -s tests -v
-```
+Agree on MongoDB names, IDs and mappings before sharing products/customers. Avoid independent duplicate stock deduction. This version supports one full-order return/refund per order, manual shipment marking and accounting adjustments rather than gateway settlement.
 
-The tests cover owner authorization, repeat requests, risk holds, stock rechecks, competing confirmations for the last item, cancellations, returns, customer isolation in chat, signed webhook deduplication, payment selection, full draft summaries, and required rejection reasons.
-
-## Project boundaries
-
-This is a working **single-business UC-4 prototype**. The owner bearer token is a local-project authentication boundary; replace it with UC-1 accounts and role-based permissions before deployment. Product management is deliberately small because UC-5 is a separate use case. The chat command adapter is a narrow bridge to UC-3, not a multilingual conversational agent. The orchestrator belongs to UC-2.
-
-Financial entries represent **booked order activity**, not cash collected. Approving a refund creates an accounting adjustment and marks payment handling for manual action; it does not move money through a gateway. Returns and refunds apply to the entire order, with one request per order in this prototype. Shipping status is entered by the owner, pending the later courier integration. Live WhatsApp needs valid business credentials and approved templates for messages outside the service window.
+Commit code/documentation on the existing branch. Keep .env, .venv and data out of Git.

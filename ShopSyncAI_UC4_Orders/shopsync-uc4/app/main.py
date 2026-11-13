@@ -7,12 +7,14 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Literal
 
+from pymongo.errors import DuplicateKeyError, PyMongoError
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import service
-from .db import initialize
+from .db import close_connection, initialize
 from .whatsapp import list_outbox, outbox_worker, retry_message, send_due
 
 
@@ -20,7 +22,11 @@ from .whatsapp import list_outbox, outbox_worker, retry_message, send_due
 async def lifespan(app):
     if not os.getenv("SHOPSYNC_OWNER_TOKEN"):
         raise RuntimeError("Set SHOPSYNC_OWNER_TOKEN before starting the app.")
-    initialize()
+    try:
+        initialize()
+    except Exception:
+        close_connection()
+        raise
     task = asyncio.create_task(outbox_worker())
     try:
         yield
@@ -28,6 +34,7 @@ async def lifespan(app):
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        close_connection()
 
 
 app = FastAPI(title="ShopSync AI UC-4 Orders", lifespan=lifespan)
@@ -38,6 +45,18 @@ STATIC = Path(__file__).resolve().parent.parent / "static"
 async def order_error(_request, exc):
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=exc.status, content={"detail": exc.message})
+
+
+@app.exception_handler(DuplicateKeyError)
+async def duplicate_error(_request, _exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=409, content={"detail": "A conflicting record already exists. Refresh and retry."})
+
+
+@app.exception_handler(PyMongoError)
+async def database_error(_request, _exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=503, content={"detail": "MongoDB is unavailable. Check the database connection and retry."})
 
 
 def owner(authorization: str = Header(default="")):
@@ -118,7 +137,7 @@ def style():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "module": "UC-4"}
+    return {"status": "ok", "module": "UC-4", "database": "mongodb"}
 
 
 @app.get("/api/products", dependencies=[Depends(owner)])
@@ -215,10 +234,10 @@ def notifications():
 
 @app.post("/api/notifications/{message_id}/retry", dependencies=[Depends(owner)])
 async def retry_notification(message_id: str):
-    if not retry_message(message_id):
+    if not await asyncio.to_thread(retry_message, message_id):
         raise HTTPException(status_code=409, detail="Message cannot be retried or was not found.")
     await send_due()
-    return {"notifications": list_outbox()}
+    return {"notifications": await asyncio.to_thread(list_outbox)}
 
 
 @app.get("/webhooks/whatsapp")
@@ -259,11 +278,12 @@ async def inbound_whatsapp(request: Request):
                     continue
                 phone = message.get("from", "")
                 try:
-                    service.chat(message["id"], phone, message.get("text", {}).get("body", ""),
-                                 profiles.get(phone, ""), live=True)
+                    await asyncio.to_thread(service.chat, message["id"], phone,
+                                            message.get("text", {}).get("body", ""),
+                                            profiles.get(phone, ""), live=True)
                 except service.OrderError:
                     continue
                 processed += 1
     # Deliver queued replies outside the order transaction. A worker also retries failures.
-    asyncio.create_task(send_due())
+    # The tracked outbox worker delivers replies independently of this webhook.
     return {"received": True, "processed": processed}

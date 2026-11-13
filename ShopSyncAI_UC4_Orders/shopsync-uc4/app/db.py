@@ -1,102 +1,135 @@
+"""MongoDB persistence. All business writes run in retryable transactions."""
 import os
-import sqlite3
-from contextlib import closing, contextmanager
+from copy import deepcopy
 from pathlib import Path
+from threading import RLock
+
+from dotenv import load_dotenv
+
+from pymongo import ASCENDING, MongoClient, ReadPreference
+from pymongo.errors import CollectionInvalid, DuplicateKeyError, OperationFailure, PyMongoError
+from pymongo.read_concern import ReadConcern
+from pymongo.write_concern import WriteConcern
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+
+COLLECTIONS = (
+    "products", "customers", "orders", "approvals", "return_requests",
+    "stock_movements", "financial_entries", "audit_events", "inbound_messages", "outbox",
+)
+_client = None
+_settings = None
+_lock = RLock()
 
 
-def database_path():
-    return Path(os.getenv("SHOPSYNC_DB", "data/shopsync.sqlite3"))
+def get_database():
+    global _client, _settings
+    uri = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true")
+    name = os.getenv("MONGODB_DB", "shopsync_uc4")
+    if not name or name in {"admin", "config", "local"}:
+        raise RuntimeError("Set MONGODB_DB to an application database name.")
+    with _lock:
+        if _client is None or _settings != (uri, name):
+            if _client is not None:
+                _client.close()
+            _client = MongoClient(uri, appname="ShopSyncAI-UC4", serverSelectionTimeoutMS=5000,
+                                  connectTimeoutMS=5000, socketTimeoutMS=20000)
+            _settings = (uri, name)
+        # Lease claims must be acknowledged durably before sending WhatsApp HTTP.
+        return _client.get_database(name, write_concern=WriteConcern("majority"))
 
 
-def connect():
-    path = database_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=10, isolation_level=None)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=10000")
-    db.execute("PRAGMA journal_mode=WAL")
-    return db
+def close_connection():
+    global _client, _settings
+    with _lock:
+        if _client is not None:
+            _client.close()
+        _client = _settings = None
 
 
-@contextmanager
-def transaction():
-    db = connect()
-    try:
-        db.execute("BEGIN IMMEDIATE")
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+def public(document):
+    if document is None:
+        return None
+    result = deepcopy(document)
+    result["id"] = str(result.pop("_id"))
+    return result
+
+
+class MongoStore:
+    """Pass one session to every operation in a business transaction."""
+    def __init__(self, database, session=None):
+        self.database, self.session = database, session
+
+    def get(self, collection, query):
+        return public(self.database[collection].find_one(query, session=self.session))
+
+    def all(self, collection, query=None, sort=None, limit=0):
+        cursor = self.database[collection].find(query or {}, session=self.session)
+        if sort:
+            cursor = cursor.sort(sort)
+        if limit:
+            cursor = cursor.limit(limit)
+        return [public(row) for row in cursor]
+
+    def count(self, collection, query=None):
+        return self.database[collection].count_documents(query or {}, session=self.session)
+
+    def insert(self, collection, document):
+        value = deepcopy(document)
+        value["_id"] = value.pop("id")
+        return self.database[collection].insert_one(value, session=self.session)
+
+    def update(self, collection, query, changes):
+        return self.database[collection].update_one(query, changes, session=self.session)
+
+
+def get_store():
+    return MongoStore(get_database())
+
+
+def run_transaction(callback):
+    database = get_database()
+    # Retry unique customer/source/message races only after the failed transaction
+    # has aborted. The callback must never send external HTTP requests.
+    for attempt in range(5):
+        try:
+            with database.client.start_session() as session:
+                return session.with_transaction(
+                    lambda current: callback(MongoStore(database, current)),
+                    read_concern=ReadConcern("snapshot"), write_concern=WriteConcern("majority"),
+                    read_preference=ReadPreference.PRIMARY, max_commit_time_ms=10000,
+                )
+        except DuplicateKeyError:
+            if attempt == 4:
+                raise
 
 
 def initialize():
-    with closing(connect()) as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS products (
-          id TEXT PRIMARY KEY, sku TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-          price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
-          stock_qty INTEGER NOT NULL CHECK(stock_qty >= 0), active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS customers (
-          id TEXT PRIMARY KEY, phone TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-          last_inbound_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS orders (
-          id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id),
-          channel TEXT NOT NULL, status TEXT NOT NULL, delivery_address TEXT NOT NULL,
-          payment_method TEXT NOT NULL, payment_status TEXT NOT NULL DEFAULT 'UNPAID',
-          total_cents INTEGER NOT NULL, risk_score INTEGER, risk_reasons TEXT,
-          source_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          shipped_at TEXT, cancelled_reason TEXT
-        );
-        CREATE TABLE IF NOT EXISTS order_items (
-          order_id TEXT NOT NULL REFERENCES orders(id), product_id TEXT NOT NULL REFERENCES products(id),
-          sku TEXT NOT NULL, name TEXT NOT NULL, unit_price_cents INTEGER NOT NULL,
-          quantity INTEGER NOT NULL CHECK(quantity > 0), PRIMARY KEY(order_id, product_id)
-        );
-        CREATE TABLE IF NOT EXISTS approvals (
-          id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id),
-          action TEXT NOT NULL, status TEXT NOT NULL, owner_reason TEXT,
-          created_at TEXT NOT NULL, decided_at TEXT,
-          UNIQUE(order_id, action)
-        );
-        CREATE TABLE IF NOT EXISTS return_requests (
-          id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
-          kind TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL,
-          owner_reason TEXT, created_at TEXT NOT NULL, decided_at TEXT, received_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS stock_movements (
-          id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id),
-          product_id TEXT NOT NULL REFERENCES products(id), kind TEXT NOT NULL,
-          change_qty INTEGER NOT NULL, created_at TEXT NOT NULL,
-          UNIQUE(order_id, product_id, kind)
-        );
-        CREATE TABLE IF NOT EXISTS financial_entries (
-          id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id),
-          kind TEXT NOT NULL, amount_cents INTEGER NOT NULL, created_at TEXT NOT NULL,
-          UNIQUE(order_id, kind)
-        );
-        CREATE TABLE IF NOT EXISTS audit_events (
-          id TEXT PRIMARY KEY, order_id TEXT, actor TEXT NOT NULL, event TEXT NOT NULL,
-          details TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS inbound_messages (
-          message_id TEXT PRIMARY KEY, phone TEXT NOT NULL, body TEXT NOT NULL,
-          response TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS outbox (
-          id TEXT PRIMARY KEY, phone TEXT NOT NULL, body TEXT NOT NULL,
-          status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-          next_attempt_at TEXT NOT NULL, provider_id TEXT, last_error TEXT,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, next_attempt_at);
-        """)
-        # A process killed during a send can leave a lease behind. Its status is
-        # unknown; an operator can inspect and retry it, avoiding an automatic duplicate.
-        db.execute("UPDATE outbox SET status='UNCERTAIN', last_error='Interrupted while sending; review before retry' WHERE status='SENDING'")
+    database = get_database()
+    try:
+        hello = database.client.admin.command("hello")
+    except PyMongoError:
+        raise RuntimeError("Cannot connect to MongoDB. Start the database or check MONGODB_URI, credentials and network access. See README.md.") from None
+    if not (hello.get("setName") or hello.get("msg") == "isdbgrid"):
+        raise RuntimeError("MongoDB transactions require a replica set or Atlas cluster. A standalone mongod is not supported; see README.md for setup.")
+    for name in (*COLLECTIONS, "migration_metadata"):
+        try:
+            database.create_collection(name)
+        except CollectionInvalid:
+            pass
+        except OperationFailure as error:
+            if error.code != 48:  # Another process may have created the collection.
+                raise
+    for name, fields, unique in (
+        ("products", [("sku", ASCENDING)], True),
+        ("customers", [("phone", ASCENDING)], True),
+        ("orders", [("source_key", ASCENDING)], True),
+        ("orders", [("customer_id", ASCENDING), ("created_at", ASCENDING)], False),
+        ("approvals", [("order_id", ASCENDING), ("action", ASCENDING)], True),
+        ("return_requests", [("order_id", ASCENDING)], True),
+        ("stock_movements", [("order_id", ASCENDING), ("product_id", ASCENDING), ("kind", ASCENDING)], True),
+        ("financial_entries", [("order_id", ASCENDING), ("kind", ASCENDING)], True),
+        ("outbox", [("status", ASCENDING), ("next_attempt_at", ASCENDING)], False),
+    ):
+        database[name].create_index(fields, unique=unique)
+    run_transaction(lambda store: store.count("products"))

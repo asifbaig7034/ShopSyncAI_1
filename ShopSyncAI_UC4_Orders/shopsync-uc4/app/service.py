@@ -1,12 +1,10 @@
-import json
 import os
 import re
-import sqlite3
 import uuid
-from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 
-from .db import connect, transaction
+from .db import get_store, run_transaction
 
 
 class OrderError(Exception):
@@ -16,11 +14,18 @@ class OrderError(Exception):
 
 
 def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def uid():
     return uuid.uuid4().hex[:16].upper()
+
+
+def atomic(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        return run_transaction(lambda store: function(store, *args, **kwargs))
+    return wrapped
 
 
 def format_pkr(cents):
@@ -28,22 +33,16 @@ def format_pkr(cents):
 
 
 def draft_summary(order):
-    """Show every detail the customer should review before confirming."""
-    lines = [
-        f"Draft {order['id']}",
-        f"Customer: {order['customer_name']} ({order['customer_phone']})",
-        "Items:",
-    ]
+    lines = [f"Draft {order['id']}",
+             f"Customer: {order['customer_name']} ({order['customer_phone']})", "Items:"]
     for item in order["items"]:
         lines.append(f"- {item['quantity']} x {item['name']} ({item['sku']}) "
                      f"at {format_pkr(item['unit_price_cents'])} = "
                      f"{format_pkr(item['quantity'] * item['unit_price_cents'])}")
-    lines.extend([
-        f"Delivery address: {order['delivery_address']}",
-        f"Payment method: {order['payment_method']}",
-        f"Total: {format_pkr(order['total_cents'])}",
-        f"Reply CONFIRM {order['id']} if these details are correct.",
-    ])
+    lines.extend([f"Delivery address: {order['delivery_address']}",
+                  f"Payment method: {order['payment_method']}",
+                  f"Total: {format_pkr(order['total_cents'])}",
+                  f"Reply CONFIRM {order['id']} if these details are correct."])
     return "\n".join(lines)
 
 
@@ -55,192 +54,194 @@ def phone_number(value):
 
 
 def log(db, order_id, actor, event, **details):
-    db.execute("INSERT INTO audit_events VALUES (?,?,?,?,?,?)",
-               (uid(), order_id, actor, event, json.dumps(details), now()))
+    db.insert("audit_events", dict(id=uid(), order_id=order_id, actor=actor,
+                                  event=event, details=details, created_at=now()))
 
 
 def queue_message(db, phone, body):
-    db.execute("INSERT INTO outbox(id,phone,body,status,next_attempt_at,created_at) VALUES(?,?,?,?,?,?)",
-               (uid(), phone, body, "PENDING", now(), now()))
+    db.insert("outbox", dict(id=uid(), phone=phone, body=body, status="PENDING",
+                            attempts=0, next_attempt_at=now(), created_at=now(),
+                            provider_id=None, last_error=None, lease_until=None, claim_id=None))
+
+
+def touch(db, order_id, **fields):
+    # Writing the same order coordinates cross-collection decisions (e.g. a
+    # cancellation racing a refund). MongoDB retries the losing transaction.
+    fields["updated_at"] = now()
+    db.update("orders", {"_id": order_id}, {"$set": fields, "$inc": {"revision": 1}})
 
 
 def customer(db, phone, name=None, inbound=False):
     phone = phone_number(phone)
-    row = db.execute("SELECT * FROM customers WHERE phone=?", (phone,)).fetchone()
+    row = db.get("customers", {"phone": phone})
     if row:
         if inbound:
-            db.execute("UPDATE customers SET last_inbound_at=? WHERE id=?", (now(), row["id"]))
+            db.update("customers", {"_id": row["id"]}, {"$set": {"last_inbound_at": now()}})
         return row["id"]
     customer_id = uid()
-    db.execute("INSERT INTO customers VALUES (?,?,?,?)",
-               (customer_id, phone, name or phone, now() if inbound else None))
+    db.insert("customers", dict(id=customer_id, phone=phone, name=name or phone,
+                               last_inbound_at=now() if inbound else None))
     return customer_id
 
 
 def product_list():
-    with closing(connect()) as db:
-        return [dict(r) for r in db.execute("SELECT * FROM products ORDER BY name")]
+    return get_store().all("products", sort=[("name", 1), ("_id", 1)])
 
 
-def add_product(sku, name, price_cents, stock_qty):
+@atomic
+def add_product(db, sku, name, price_cents, stock_qty):
     sku = sku.strip().upper()
     if not sku or not name.strip() or price_cents < 0 or stock_qty < 0:
         raise OrderError("Provide SKU, name, nonnegative price and stock.")
-    with transaction() as db:
-        try:
-            db.execute("INSERT INTO products VALUES (?,?,?,?,?,1)",
-                       (uid(), sku, name.strip(), price_cents, stock_qty))
-        except sqlite3.IntegrityError:
-            raise OrderError("SKU already exists.", 409)
-        log(db, None, "owner", "product_created", sku=sku, stock_qty=stock_qty)
-        return dict(db.execute("SELECT * FROM products WHERE sku=?", (sku,)).fetchone())
+    if db.get("products", {"sku": sku}):
+        raise OrderError("SKU already exists.", 409)
+    product = dict(id=uid(), sku=sku, name=name.strip(), price_cents=price_cents,
+                   stock_qty=stock_qty, active=True)
+    db.insert("products", product)
+    log(db, None, "owner", "product_created", sku=sku, stock_qty=stock_qty)
+    return product
 
 
-def restock_product(product_id, quantity):
+@atomic
+def restock_product(db, product_id, quantity):
     if quantity <= 0:
         raise OrderError("Restock quantity must be positive.")
-    with transaction() as db:
-        result = db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
-                            (quantity, product_id))
-        if not result.rowcount:
-            raise OrderError("Product not found.", 404)
-        log(db, None, "owner", "manual_restock", product_id=product_id, quantity=quantity)
-        return dict(db.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone())
+    result = db.update("products", {"_id": product_id}, {"$inc": {"stock_qty": quantity}})
+    if not result.matched_count:
+        raise OrderError("Product not found.", 404)
+    log(db, None, "owner", "manual_restock", product_id=product_id, quantity=quantity)
+    return db.get("products", {"_id": product_id})
 
 
 def order_view(db, order_id, requester_phone=None):
-    order = db.execute("SELECT o.*, c.phone AS customer_phone, c.name AS customer_name "
-                       "FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.id=?", (order_id,)).fetchone()
-    if not order or (requester_phone and order["customer_phone"] != phone_number(requester_phone)):
+    order = db.get("orders", {"_id": order_id})
+    if not order:
         raise OrderError("Order not found.", 404)
-    result = dict(order)
-    result["risk_reasons"] = json.loads(result["risk_reasons"] or "[]")
-    result["items"] = [dict(r) for r in db.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,))]
-    result["approval"] = next((dict(r) for r in db.execute(
-        "SELECT * FROM approvals WHERE order_id=?", (order_id,))), None)
-    result["return_request"] = next((dict(r) for r in db.execute(
-        "SELECT * FROM return_requests WHERE order_id=?", (order_id,))), None)
-    return result
+    person = db.get("customers", {"_id": order["customer_id"]})
+    if not person or (requester_phone and person["phone"] != phone_number(requester_phone)):
+        raise OrderError("Order not found.", 404)
+    order["customer_phone"], order["customer_name"] = person["phone"], person["name"]
+    order["risk_reasons"] = order.get("risk_reasons") or []
+    for item in order["items"]:
+        item["order_id"] = order_id
+    order["approval"] = db.get("approvals", {"order_id": order_id})
+    order["return_request"] = db.get("return_requests", {"order_id": order_id})
+    return order
 
 
 def get_order(order_id, requester_phone=None):
-    with closing(connect()) as db:
-        return order_view(db, order_id, requester_phone)
+    return order_view(get_store(), order_id, requester_phone)
 
 
 def list_orders():
-    with closing(connect()) as db:
-        ids = [r[0] for r in db.execute("SELECT id FROM orders ORDER BY created_at DESC, rowid DESC")]
-        return [order_view(db, item) for item in ids]
+    db = get_store()
+    return [order_view(db, row["id"]) for row in
+            db.all("orders", sort=[("created_at", -1), ("_id", -1)])]
 
 
-def _draft(db, phone, name, items, delivery_address, payment_method, channel, source_key, actor):
-    existing = db.execute("SELECT id FROM orders WHERE source_key=?", (source_key,)).fetchone()
-    if existing:
-        return order_view(db, existing["id"])
-    if not delivery_address.strip() or len(delivery_address) > 500:
-        raise OrderError("Provide a delivery address (maximum 500 characters).")
-    if payment_method not in ("COD", "BANK_TRANSFER"):
-        raise OrderError("Payment method must be COD or BANK_TRANSFER.")
-    if not items or len(items) > 25:
-        raise OrderError("An order needs 1 to 25 distinct products.")
-    if len({item["product_id"] for item in items}) != len(items):
-        raise OrderError("List each product once with its total quantity.")
-    resolved, total = [], 0
+def resolve_items(db, items):
+    if not items or len(items) > 25 or len({i["product_id"] for i in items}) != len(items):
+        raise OrderError("Provide 1 to 25 distinct products.")
+    resolved = []
     for item in items:
         quantity = item["quantity"]
         if not 1 <= quantity <= 100:
             raise OrderError("Each quantity must be between 1 and 100.")
-        p = db.execute("SELECT * FROM products WHERE id=? AND active=1", (item["product_id"],)).fetchone()
-        if not p:
+        product = db.get("products", {"_id": item["product_id"], "active": True})
+        if not product:
             raise OrderError("Product not found or inactive.", 404)
-        if p["stock_qty"] < quantity:
-            raise OrderError(f"Insufficient stock for {p['sku']}.", 409)
-        resolved.append((p, quantity))
-        total += p["price_cents"] * quantity
+        if product["stock_qty"] < quantity:
+            raise OrderError(f"Insufficient stock for {product['sku']}.", 409)
+        resolved.append(dict(product_id=product["id"], sku=product["sku"], name=product["name"],
+                             unit_price_cents=product["price_cents"], quantity=quantity))
+    return resolved, sum(i["unit_price_cents"] * i["quantity"] for i in resolved)
+
+
+def validate_delivery(address, payment):
+    if not address.strip() or len(address) > 500:
+        raise OrderError("Provide a delivery address (maximum 500 characters).")
+    if payment not in ("COD", "BANK_TRANSFER"):
+        raise OrderError("Payment method must be COD or BANK_TRANSFER.")
+
+
+def _draft(db, phone, name, items, delivery_address, payment_method, channel, source_key, actor):
+    existing = db.get("orders", {"source_key": source_key})
+    if existing:
+        result = order_view(db, existing["id"])
+        if result["customer_phone"] != phone_number(phone):
+            raise OrderError("Source key is already used by another customer.", 409)
+        return result
+    validate_delivery(delivery_address, payment_method)
+    resolved, total = resolve_items(db, items)
     customer_id = customer(db, phone, name)
     order_id = uid()
-    db.execute("INSERT INTO orders(id,customer_id,channel,status,delivery_address,payment_method,"
-               "total_cents,source_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-               (order_id, customer_id, channel, "DRAFT", delivery_address.strip(),
-                payment_method, total, source_key, now(), now()))
-    for p, quantity in resolved:
-        db.execute("INSERT INTO order_items VALUES(?,?,?,?,?,?)",
-                   (order_id, p["id"], p["sku"], p["name"], p["price_cents"], quantity))
+    db.insert("orders", dict(
+        id=order_id, customer_id=customer_id, channel=channel, status="DRAFT",
+        delivery_address=delivery_address.strip(), payment_method=payment_method,
+        payment_status="UNPAID", total_cents=total, source_key=source_key,
+        risk_score=None, risk_reasons=[], items=resolved, revision=0,
+        created_at=now(), updated_at=now(), shipped_at=None, cancelled_reason=None))
     log(db, order_id, actor, "draft_created", total_cents=total)
     return order_view(db, order_id)
 
 
-def create_draft(phone, name, items, delivery_address, payment_method, source_key):
-    with transaction() as db:
-        return _draft(db, phone, name, items, delivery_address, payment_method,
-                      "owner", source_key, "owner")
+@atomic
+def create_draft(db, phone, name, items, delivery_address, payment_method, source_key):
+    return _draft(db, phone, name, items, delivery_address, payment_method, "owner", source_key, "owner")
 
 
 def _edit_draft(db, order_id, items, address, actor, requester_phone=None, payment_method=None):
     order = order_view(db, order_id, requester_phone)
     if order["status"] != "DRAFT":
         raise OrderError("Only a draft can be edited.", 409)
-    if not address.strip() or len(address) > 500:
-        raise OrderError("Provide a delivery address (maximum 500 characters).")
-    method = payment_method or order["payment_method"]
-    if method not in ("COD", "BANK_TRANSFER"):
-        raise OrderError("Payment method must be COD or BANK_TRANSFER.")
-    if not items or len(items) > 25 or len({i["product_id"] for i in items}) != len(items):
-        raise OrderError("Provide 1 to 25 distinct products.")
-    resolved, total = [], 0
-    for item in items:
-        qty = item["quantity"]
-        p = db.execute("SELECT * FROM products WHERE id=? AND active=1", (item["product_id"],)).fetchone()
-        if not p or not 1 <= qty <= 100 or p["stock_qty"] < qty:
-            raise OrderError("Invalid product, quantity, or insufficient stock.", 409)
-        resolved.append((p, qty))
-        total += p["price_cents"] * qty
-    db.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
-    for p, qty in resolved:
-        db.execute("INSERT INTO order_items VALUES(?,?,?,?,?,?)",
-                   (order_id, p["id"], p["sku"], p["name"], p["price_cents"], qty))
-    db.execute("UPDATE orders SET delivery_address=?,payment_method=?,total_cents=?,updated_at=? WHERE id=?",
-               (address.strip(), method, total, now(), order_id))
+    method = payment_method if payment_method is not None else order["payment_method"]
+    validate_delivery(address, method)
+    resolved, total = resolve_items(db, items)
+    touch(db, order_id, delivery_address=address.strip(), payment_method=method,
+          total_cents=total, items=resolved)
     log(db, order_id, actor, "draft_edited", total_cents=total)
     return order_view(db, order_id)
 
 
-def edit_draft(order_id, items, address, payment_method=None):
-    with transaction() as db:
-        return _edit_draft(db, order_id, items, address, "owner", payment_method=payment_method)
+@atomic
+def edit_draft(db, order_id, items, address, payment_method=None):
+    return _edit_draft(db, order_id, items, address, "owner", payment_method=payment_method)
 
 
 def _risk(db, order):
-    # Explicit, reproducible review indicators; no claim of detecting fraud.
     reasons, score = [], 0
     if order["total_cents"] >= int(os.getenv("SHOPSYNC_RISK_AMOUNT_CENTS", "2000000")):
         score += 60
         reasons.append("Order total exceeds configured review amount")
-    total_qty = db.execute("SELECT SUM(quantity) FROM order_items WHERE order_id=?", (order["id"],)).fetchone()[0]
-    if total_qty >= 6:
+    if sum(i["quantity"] for i in order["items"]) >= 6:
         score += 25
         reasons.append("Large item quantity")
-    previous = db.execute("SELECT COUNT(*) FROM orders WHERE customer_id=? AND status='CANCELLED'",
-                          (order["customer_id"],)).fetchone()[0]
-    if previous >= 2:
+    if db.count("orders", {"customer_id": order["customer_id"], "status": "CANCELLED"}) >= 2:
         score += 25
         reasons.append("Two or more previous cancellations")
     return min(score, 100), reasons or ["No configured review indicators matched"]
 
 
+def movement(db, order_id, item, kind, amount):
+    db.insert("stock_movements", dict(id=uid(), order_id=order_id, product_id=item["product_id"],
+                                     kind=kind, change_qty=amount, created_at=now()))
+
+
+def financial_entry(db, order, kind, amount):
+    db.insert("financial_entries", dict(id=uid(), order_id=order["id"], kind=kind,
+                                       amount_cents=amount, created_at=now()))
+
+
 def _book(db, order, actor):
-    # Caller owns BEGIN IMMEDIATE. Order + inventory + sale commit or roll back together.
-    for item in db.execute("SELECT * FROM order_items WHERE order_id=?", (order["id"],)):
-        result = db.execute("UPDATE products SET stock_qty=stock_qty-? WHERE id=? AND stock_qty>=?",
-                            (item["quantity"], item["product_id"], item["quantity"]))
-        if result.rowcount != 1:
+    for item in order["items"]:
+        result = db.update("products", {"_id": item["product_id"], "active": True,
+                                        "stock_qty": {"$gte": item["quantity"]}},
+                           {"$inc": {"stock_qty": -item["quantity"]}})
+        if result.modified_count != 1:
             raise OrderError(f"Insufficient stock for {item['sku']}; order remains unconfirmed.", 409)
-        db.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?)",
-                   (uid(), order["id"], item["product_id"], "CONFIRM", -item["quantity"], now()))
-    db.execute("INSERT INTO financial_entries VALUES(?,?,?,?,?)",
-               (uid(), order["id"], "SALE", order["total_cents"], now()))
-    db.execute("UPDATE orders SET status='CONFIRMED',updated_at=? WHERE id=?", (now(), order["id"]))
+        movement(db, order["id"], item, "CONFIRM", -item["quantity"])
+    financial_entry(db, order, "SALE", order["total_cents"])
+    touch(db, order["id"], status="CONFIRMED")
     log(db, order["id"], actor, "order_confirmed")
 
 
@@ -251,42 +252,41 @@ def _confirm(db, order_id, actor, requester_phone=None):
     if order["status"] != "DRAFT":
         raise OrderError("Only a draft can be confirmed.", 409)
     score, reasons = _risk(db, order)
-    db.execute("UPDATE orders SET risk_score=?,risk_reasons=?,updated_at=? WHERE id=?",
-               (score, json.dumps(reasons), now(), order_id))
+    touch(db, order_id, risk_score=score, risk_reasons=reasons)
     if score >= int(os.getenv("SHOPSYNC_RISK_THRESHOLD", "50")):
-        db.execute("UPDATE orders SET status='RISK_HOLD' WHERE id=?", (order_id,))
-        db.execute("INSERT INTO approvals(id,order_id,action,status,created_at) VALUES(?,?,?,?,?)",
-                   (uid(), order_id, "HIGH_RISK_ORDER", "PENDING", now()))
+        touch(db, order_id, status="RISK_HOLD")
+        db.insert("approvals", dict(id=uid(), order_id=order_id, action="HIGH_RISK_ORDER",
+                                   status="PENDING", owner_reason=None, created_at=now(), decided_at=None))
         log(db, order_id, actor, "risk_hold", score=score, reasons=reasons)
     else:
         _book(db, order, actor)
     return order_view(db, order_id)
 
 
-def confirm(order_id, requester_phone=None):
-    with transaction() as db:
-        return _confirm(db, order_id, "customer" if requester_phone else "owner", requester_phone)
+@atomic
+def confirm(db, order_id, requester_phone=None):
+    return _confirm(db, order_id, "customer" if requester_phone else "owner", requester_phone)
 
 
-def decide_risk(order_id, approve, reason):
-    with transaction() as db:
-        order = order_view(db, order_id)
-        if order["status"] in ("CONFIRMED", "REJECTED") and order["approval"]:
-            return order
-        if order["status"] != "RISK_HOLD":
-            raise OrderError("This order is not awaiting risk review.", 409)
-        if approve:
-            _book(db, order, "owner")  # Stock may have changed since the hold.
-        else:
-            db.execute("UPDATE orders SET status='REJECTED',updated_at=? WHERE id=?", (now(), order_id))
-        db.execute("UPDATE approvals SET status=?,owner_reason=?,decided_at=? WHERE order_id=?",
-                   ("APPROVED" if approve else "REJECTED", reason.strip(), now(), order_id))
-        log(db, order_id, "owner", "risk_decision", approved=approve, reason=reason)
-        if order["channel"] == "whatsapp":
-            queue_message(db, order["customer_phone"],
-                          f"Order {order_id} {'confirmed' if approve else 'rejected after review'}." +
-                          (f" Reason: {reason.strip()}" if not approve and reason.strip() else ""))
-        return order_view(db, order_id)
+@atomic
+def decide_risk(db, order_id, approve, reason):
+    order = order_view(db, order_id)
+    if order["status"] in ("CONFIRMED", "REJECTED") and order["approval"]:
+        return order
+    if order["status"] != "RISK_HOLD":
+        raise OrderError("This order is not awaiting risk review.", 409)
+    if approve:
+        _book(db, order, "owner")
+    else:
+        touch(db, order_id, status="REJECTED")
+    db.update("approvals", {"order_id": order_id}, {"$set": {
+        "status": "APPROVED" if approve else "REJECTED", "owner_reason": reason.strip(), "decided_at": now()}})
+    log(db, order_id, "owner", "risk_decision", approved=approve, reason=reason.strip())
+    if order["channel"] == "whatsapp":
+        queue_message(db, order["customer_phone"],
+                      f"Order {order_id} {'confirmed' if approve else 'rejected after review'}." +
+                      (f" Reason: {reason.strip()}" if not approve and reason.strip() else ""))
+    return order_view(db, order_id)
 
 
 def _cancel(db, order_id, actor, requester_phone=None):
@@ -295,42 +295,42 @@ def _cancel(db, order_id, actor, requester_phone=None):
         return order
     if order["status"] not in ("DRAFT", "RISK_HOLD", "CONFIRMED") or order["shipped_at"]:
         raise OrderError("Only an unshipped order can be cancelled.", 409)
+    request = order["return_request"]
+    if request and request["status"] not in ("REJECTED", "REJECTED_AFTER_INSPECTION"):
+        raise OrderError("An active or completed return/refund prevents cancellation.", 409)
     if order["status"] == "CONFIRMED":
         for item in order["items"]:
-            db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
-                       (item["quantity"], item["product_id"]))
-            db.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?)",
-                       (uid(), order_id, item["product_id"], "CANCEL", item["quantity"], now()))
-        db.execute("INSERT INTO financial_entries VALUES(?,?,?,?,?)",
-                   (uid(), order_id, "CANCELLATION", -order["total_cents"], now()))
-    db.execute("UPDATE orders SET status='CANCELLED',cancelled_reason='Requested by customer or owner',updated_at=? WHERE id=?",
-               (now(), order_id))
-    db.execute("UPDATE approvals SET status='CANCELLED',decided_at=? WHERE order_id=? AND status='PENDING'",
-               (now(), order_id))
+            db.update("products", {"_id": item["product_id"]}, {"$inc": {"stock_qty": item["quantity"]}})
+            movement(db, order_id, item, "CANCEL", item["quantity"])
+        financial_entry(db, order, "CANCELLATION", -order["total_cents"])
+    touch(db, order_id, status="CANCELLED", cancelled_reason="Requested by customer or owner")
+    db.update("approvals", {"order_id": order_id, "status": "PENDING"},
+              {"$set": {"status": "CANCELLED", "decided_at": now()}})
     log(db, order_id, actor, "order_cancelled")
     if actor == "owner" and order["channel"] == "whatsapp":
         queue_message(db, order["customer_phone"], f"Order {order_id} has been cancelled.")
     return order_view(db, order_id)
 
 
-def cancel(order_id, requester_phone=None):
-    with transaction() as db:
-        return _cancel(db, order_id, "customer" if requester_phone else "owner", requester_phone)
+@atomic
+def cancel(db, order_id, requester_phone=None):
+    return _cancel(db, order_id, "customer" if requester_phone else "owner", requester_phone)
 
 
-def mark_shipped(order_id):
-    with transaction() as db:
-        order = order_view(db, order_id)
-        if order["status"] == "SHIPPED":
-            return order
-        if order["status"] != "CONFIRMED":
-            raise OrderError("Only a confirmed order can be marked shipped.", 409)
-        db.execute("UPDATE orders SET status='SHIPPED',shipped_at=?,updated_at=? WHERE id=?",
-                   (now(), now(), order_id))
-        log(db, order_id, "owner", "order_shipped")
-        if order["channel"] == "whatsapp":
-            queue_message(db, order["customer_phone"], f"Order {order_id} has been marked shipped.")
-        return order_view(db, order_id)
+@atomic
+def mark_shipped(db, order_id):
+    order = order_view(db, order_id)
+    if order["status"] == "SHIPPED":
+        return order
+    if order["status"] != "CONFIRMED":
+        raise OrderError("Only a confirmed order can be marked shipped.", 409)
+    if order["return_request"] and order["return_request"]["status"] != "REJECTED":
+        raise OrderError("Resolve the return/refund before shipping this order.", 409)
+    touch(db, order_id, status="SHIPPED", shipped_at=now())
+    log(db, order_id, "owner", "order_shipped")
+    if order["channel"] == "whatsapp":
+        queue_message(db, order["customer_phone"], f"Order {order_id} has been marked shipped.")
+    return order_view(db, order_id)
 
 
 def _request_return(db, order_id, kind, reason, actor, requester_phone=None):
@@ -347,166 +347,177 @@ def _request_return(db, order_id, kind, reason, actor, requester_phone=None):
     window_start = datetime.fromisoformat(order["shipped_at"] or order["created_at"])
     if datetime.now(timezone.utc) > window_start + timedelta(days=int(os.getenv("SHOPSYNC_RETURN_DAYS", "14"))):
         raise OrderError("Request is outside the return window.", 409)
-    db.execute("INSERT INTO return_requests(id,order_id,kind,reason,status,created_at) VALUES(?,?,?,?,?,?)",
-               (uid(), order_id, kind, reason.strip()[:500], "PENDING", now()))
+    db.insert("return_requests", dict(id=uid(), order_id=order_id, kind=kind, reason=reason.strip()[:500],
+                                     status="PENDING", owner_reason=None, created_at=now(),
+                                     decided_at=None, received_at=None))
+    touch(db, order_id)
     log(db, order_id, actor, "return_requested", kind=kind)
     return order_view(db, order_id)
 
 
-def request_return(order_id, kind, reason, requester_phone=None):
-    with transaction() as db:
-        return _request_return(db, order_id, kind, reason,
-                               "customer" if requester_phone else "owner", requester_phone)
+@atomic
+def request_return(db, order_id, kind, reason, requester_phone=None):
+    return _request_return(db, order_id, kind, reason, "customer" if requester_phone else "owner", requester_phone)
 
 
 def _refund_entry(db, order):
-    # Bookkeeping reversal only; the owner performs any real gateway refund separately.
-    db.execute("INSERT INTO financial_entries VALUES(?,?,?,?,?)",
-               (uid(), order["id"], "REFUND", -order["total_cents"], now()))
-    db.execute("UPDATE orders SET payment_status='REFUND_REQUIRES_MANUAL_ACTION',updated_at=? WHERE id=?",
-               (now(), order["id"]))
+    financial_entry(db, order, "REFUND", -order["total_cents"])
+    touch(db, order["id"], payment_status="REFUND_REQUIRES_MANUAL_ACTION")
 
 
-def decide_return(request_id, approve, reason):
-    with transaction() as db:
-        row = db.execute("SELECT * FROM return_requests WHERE id=?", (request_id,)).fetchone()
-        if not row:
-            raise OrderError("Request not found.", 404)
-        order = order_view(db, row["order_id"])
-        if row["status"] != "PENDING":
-            return order
-        if not approve and not reason.strip():
-            raise OrderError("A rejection reason is required for a return or refund.")
-        status = "REJECTED"
-        if approve:
-            status = "APPROVED_AWAITING_RECEIPT" if row["kind"] == "RETURN" else "COMPLETED"
-            if row["kind"] == "REFUND":
-                _refund_entry(db, order)
-        db.execute("UPDATE return_requests SET status=?,owner_reason=?,decided_at=? WHERE id=?",
-                   (status, reason.strip(), now(), request_id))
-        log(db, order["id"], "owner", "return_decision", approved=approve, kind=row["kind"])
-        if order["channel"] == "whatsapp":
-            queue_message(db, order["customer_phone"],
-                          f"Your {row['kind'].lower()} request for {order['id']} is {status.lower().replace('_',' ')}." +
-                          (f" Reason: {reason.strip()}" if not approve else ""))
-        return order_view(db, order["id"])
-
-
-def receive_return(request_id, accept, reason=""):
-    with transaction() as db:
-        row = db.execute("SELECT * FROM return_requests WHERE id=?", (request_id,)).fetchone()
-        if not row:
-            raise OrderError("Request not found.", 404)
-        order = order_view(db, row["order_id"])
-        if row["status"] in ("COMPLETED", "REJECTED_AFTER_INSPECTION"):
-            return order
-        if row["kind"] != "RETURN" or row["status"] != "APPROVED_AWAITING_RECEIPT":
-            raise OrderError("Return is not awaiting item inspection.", 409)
-        if not accept and not reason.strip():
-            raise OrderError("A reason is required when rejecting a returned item.")
-        if accept:
-            for item in order["items"]:
-                db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
-                           (item["quantity"], item["product_id"]))
-                db.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?)",
-                           (uid(), order["id"], item["product_id"], "RETURN", item["quantity"], now()))
+@atomic
+def decide_return(db, request_id, approve, reason):
+    row = db.get("return_requests", {"_id": request_id})
+    if not row:
+        raise OrderError("Request not found.", 404)
+    order = order_view(db, row["order_id"])
+    if row["status"] != "PENDING":
+        return order
+    if order["status"] not in ("CONFIRMED", "SHIPPED"):
+        raise OrderError("This order no longer qualifies for a return/refund decision.", 409)
+    if not approve and not reason.strip():
+        raise OrderError("A rejection reason is required for a return or refund.")
+    status = "REJECTED"
+    if approve:
+        status = "APPROVED_AWAITING_RECEIPT" if row["kind"] == "RETURN" else "COMPLETED"
+        if row["kind"] == "REFUND":
             _refund_entry(db, order)
-        status = "COMPLETED" if accept else "REJECTED_AFTER_INSPECTION"
-        db.execute("UPDATE return_requests SET status=?,owner_reason=?,received_at=? WHERE id=?",
-                   (status, row["owner_reason"] if accept else reason.strip(), now(), request_id))
-        log(db, order["id"], "owner", "return_inspected", accepted=accept, reason=reason.strip())
-        if order["channel"] == "whatsapp":
-            queue_message(db, order["customer_phone"],
-                          f"Return for {order['id']} {status.lower().replace('_',' ')}." +
-                          (f" Reason: {reason.strip()}" if not accept else ""))
-        return order_view(db, order["id"])
+    db.update("return_requests", {"_id": request_id},
+              {"$set": {"status": status, "owner_reason": reason.strip(), "decided_at": now()}})
+    touch(db, order["id"])
+    log(db, order["id"], "owner", "return_decision", approved=approve, kind=row["kind"], reason=reason.strip())
+    if order["channel"] == "whatsapp":
+        queue_message(db, order["customer_phone"],
+                      f"Your {row['kind'].lower()} request for {order['id']} is {status.lower().replace('_', ' ')}." +
+                      (f" Reason: {reason.strip()}" if not approve else ""))
+    return order_view(db, order["id"])
+
+
+@atomic
+def receive_return(db, request_id, accept, reason=""):
+    row = db.get("return_requests", {"_id": request_id})
+    if not row:
+        raise OrderError("Request not found.", 404)
+    order = order_view(db, row["order_id"])
+    if row["status"] in ("COMPLETED", "REJECTED_AFTER_INSPECTION"):
+        return order
+    if row["kind"] != "RETURN" or row["status"] != "APPROVED_AWAITING_RECEIPT":
+        raise OrderError("Return is not awaiting item inspection.", 409)
+    if order["status"] not in ("CONFIRMED", "SHIPPED"):
+        raise OrderError("This order no longer qualifies for return inspection.", 409)
+    if not accept and not reason.strip():
+        raise OrderError("A reason is required when rejecting a returned item.")
+    if accept:
+        for item in order["items"]:
+            db.update("products", {"_id": item["product_id"]}, {"$inc": {"stock_qty": item["quantity"]}})
+            movement(db, order["id"], item, "RETURN", item["quantity"])
+        _refund_entry(db, order)
+    status = "COMPLETED" if accept else "REJECTED_AFTER_INSPECTION"
+    db.update("return_requests", {"_id": request_id}, {"$set": {
+        "status": status, "owner_reason": row["owner_reason"] if accept else reason.strip(), "received_at": now()}})
+    touch(db, order["id"])
+    log(db, order["id"], "owner", "return_inspected", accepted=accept, reason=reason.strip())
+    if order["channel"] == "whatsapp":
+        queue_message(db, order["customer_phone"], f"Return for {order['id']} {status.lower().replace('_', ' ')}." +
+                      (f" Reason: {reason.strip()}" if not accept else ""))
+    return order_view(db, order["id"])
 
 
 def financial_summary():
-    with closing(connect()) as db:
-        entries = [dict(r) for r in db.execute("SELECT * FROM financial_entries ORDER BY created_at DESC")]
-        return {"entries": entries, "booked_net_cents": sum(x["amount_cents"] for x in entries)}
+    entries = get_store().all("financial_entries", sort=[("created_at", -1), ("_id", -1)])
+    return {"entries": entries, "booked_net_cents": sum(x["amount_cents"] for x in entries)}
 
 
 def audit_log():
-    with closing(connect()) as db:
-        return [dict(r) for r in db.execute("SELECT * FROM audit_events ORDER BY created_at DESC, rowid DESC LIMIT 200")]
+    return get_store().all("audit_events", sort=[("created_at", -1), ("_id", -1)], limit=200)
+
+
+def _chat_operation(db, phone, text, name, live, message_id):
+    parts = text.strip().split(maxsplit=2)
+    cmd = parts[0].upper() if parts else ""
+    if cmd in ("ORDER", "EDIT"):
+        pattern = (r"ORDER\s+(\S+)\s+(\d+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)" if cmd == "ORDER" else
+                   r"EDIT\s+(\S+)\s+(\S+)\s+(\d+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)")
+        match = re.fullmatch(pattern, text.strip(), re.I | re.S)
+        if not match:
+            if cmd == "ORDER":
+                raise OrderError("Choose payment method: ORDER SKU QUANTITY | delivery address | COD or BANK_TRANSFER")
+            raise OrderError("Use: EDIT ORDER_ID SKU QUANTITY | delivery address | COD or BANK_TRANSFER")
+        values = match.groups()
+        sku, quantity, address, payment = values[-4:]
+        if len(quantity) > 3:
+            raise OrderError("Quantity must be between 1 and 100.")
+        product = db.get("products", {"sku": sku.upper(), "active": True})
+        if not product:
+            raise OrderError("Unknown SKU. Ask the owner for the product code.", 404)
+        items = [{"product_id": product["id"], "quantity": int(quantity)}]
+        method = payment.strip().upper().replace(" ", "_")
+        if cmd == "ORDER":
+            order = _draft(db, phone, name, items, address, method,
+                           "whatsapp" if live else "simulation", "chat:" + message_id, "customer")
+        else:
+            order = _edit_draft(db, values[0].upper(), items, address, "customer", phone, method)
+        return draft_summary(order)
+    if cmd in ("CONFIRM", "STATUS", "CANCEL") and len(parts) >= 2:
+        order_id = parts[1].upper()
+        if cmd == "CONFIRM":
+            order = _confirm(db, order_id, "customer", phone)
+        elif cmd == "CANCEL":
+            order = _cancel(db, order_id, "customer", phone)
+        else:
+            order = order_view(db, order_id, phone)
+        reply = f"Order {order_id}: {order['status']}."
+        if order["status"] == "RISK_HOLD":
+            reply += " Awaiting owner review; no stock or sale has been recorded."
+        request = order["return_request"]
+        if request:
+            reply += f" {request['kind'].title()} request: {request['status'].replace('_', ' ').lower()}."
+            if request["status"] in ("REJECTED", "REJECTED_AFTER_INSPECTION") and request["owner_reason"]:
+                reply += f" Reason: {request['owner_reason']}"
+        return reply
+    if cmd in ("RETURN", "REFUND") and len(parts) == 3:
+        order = _request_return(db, parts[1].upper(), cmd, parts[2], "customer", phone)
+        return f"{cmd.title()} request for {order['id']} recorded for owner review."
+    return ("Commands: ORDER SKU QTY | address | COD or BANK_TRANSFER; "
+            "EDIT ORDER_ID SKU QTY | address | COD or BANK_TRANSFER; CONFIRM ORDER_ID; STATUS ORDER_ID; "
+            "CANCEL ORDER_ID; RETURN ORDER_ID reason; REFUND ORDER_ID reason.")
 
 
 def chat(message_id, phone, text, name="", live=False):
     phone = phone_number(phone)
-    with transaction() as db:
-        old = db.execute("SELECT response FROM inbound_messages WHERE message_id=?", (message_id,)).fetchone()
-        if old:
-            return old["response"]
-        customer(db, phone, name, inbound=live)
-        parts = text.strip().split(maxsplit=2)
-        cmd = parts[0].upper() if parts else ""
-        # A failed multi-product confirmation may have written one stock row.
-        # Roll back the command while still remembering the error reply for webhook deduplication.
-        db.execute("SAVEPOINT chat_operation")
-        try:
-            if cmd == "ORDER":
-                match = re.fullmatch(r"ORDER\s+(\S+)\s+(\d+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)",
-                                     text.strip(), re.I | re.S)
-                if not match:
-                    raise OrderError("Choose payment method: ORDER SKU QUANTITY | delivery address | COD or BANK_TRANSFER")
-                sku, quantity, address, payment = match.groups()
-                if len(quantity) > 3:
-                    raise OrderError("Quantity must be between 1 and 100.")
-                payment_method = payment.strip().upper().replace(" ", "_")
-                p = db.execute("SELECT id FROM products WHERE sku=? AND active=1", (sku.upper(),)).fetchone()
-                if not p:
-                    raise OrderError("Unknown SKU. Ask the owner for the product code.", 404)
-                order = _draft(db, phone, name, [{"product_id": p["id"], "quantity": int(quantity)}],
-                               address, payment_method, "whatsapp" if live else "simulation", "chat:" + message_id,
-                               "customer")
-                reply = draft_summary(order)
-            elif cmd == "EDIT":
-                match = re.fullmatch(r"EDIT\s+(\S+)\s+(\S+)\s+(\d+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)",
-                                     text.strip(), re.I | re.S)
-                if not match:
-                    raise OrderError("Use: EDIT ORDER_ID SKU QUANTITY | delivery address | COD or BANK_TRANSFER")
-                order_id, sku, quantity, address, payment = match.groups()
-                if len(quantity) > 3:
-                    raise OrderError("Quantity must be between 1 and 100.")
-                p = db.execute("SELECT id FROM products WHERE sku=? AND active=1", (sku.upper(),)).fetchone()
-                if not p:
-                    raise OrderError("Unknown SKU.", 404)
-                edited = _edit_draft(db, order_id.upper(), [{"product_id": p["id"], "quantity": int(quantity)}],
-                                     address, "customer", phone,
-                                     payment_method=payment.strip().upper().replace(" ", "_"))
-                reply = draft_summary(edited)
-            elif cmd in ("CONFIRM", "STATUS", "CANCEL") and len(parts) >= 2:
-                order_id = parts[1].upper()
-                if cmd == "CONFIRM":
-                    order = _confirm(db, order_id, "customer", phone)
-                elif cmd == "CANCEL":
-                    order = _cancel(db, order_id, "customer", phone)
-                else:
-                    order = order_view(db, order_id, phone)
-                reply = f"Order {order_id}: {order['status']}."
-                if order["status"] == "RISK_HOLD":
-                    reply += " Awaiting owner review; no stock or sale has been recorded."
-                request = order["return_request"]
-                if request:
-                    reply += f" {request['kind'].title()} request: {request['status'].replace('_', ' ').lower()}."
-                    if request["status"] in ("REJECTED", "REJECTED_AFTER_INSPECTION") and request["owner_reason"]:
-                        reply += f" Reason: {request['owner_reason']}"
-            elif cmd in ("RETURN", "REFUND") and len(parts) == 3:
-                order = _request_return(db, parts[1].upper(), cmd, parts[2], "customer", phone)
-                reply = f"{cmd.title()} request for {order['id']} recorded for owner review."
-            else:
-                reply = ("Commands: ORDER SKU QTY | address | COD or BANK_TRANSFER; "
-                         "EDIT ORDER_ID SKU QTY | address | COD or BANK_TRANSFER; CONFIRM ORDER_ID; STATUS ORDER_ID; "
-                         "CANCEL ORDER_ID; RETURN ORDER_ID reason; REFUND ORDER_ID reason.")
-        except OrderError as exc:
-            db.execute("ROLLBACK TO SAVEPOINT chat_operation")
-            reply = exc.message
-        finally:
-            db.execute("RELEASE SAVEPOINT chat_operation")
-        db.execute("INSERT INTO inbound_messages VALUES (?,?,?,?,?)",
-                   (message_id, phone, text[:2000], reply, now()))
+
+    def existing(db):
+        row = db.get("inbound_messages", {"_id": message_id})
+        if row and row["phone"] != phone:
+            raise OrderError("Message ID is already used by another sender.", 409)
+        return row
+
+    def record(db, reply):
+        db.insert("inbound_messages", dict(id=message_id, message_id=message_id, phone=phone,
+                                          body=text[:2000], response=reply, created_at=now()))
         if live:
             queue_message(db, phone, reply)
         return reply
+
+    def process(db):
+        row = existing(db)
+        if row:
+            return row["response"]
+        customer(db, phone, name, inbound=live)
+        reply = _chat_operation(db, phone, text, name, live, message_id)
+        return record(db, reply)
+
+    try:
+        return run_transaction(process)
+    except OrderError as error:
+        # MongoDB has no SAVEPOINT. Business changes have been aborted before
+        # saving this error response in a NEW transaction.
+        error_reply = error.message
+
+        def record_error(db):
+            row = existing(db)
+            if row:
+                return row["response"]
+            customer(db, phone, name, inbound=live)
+            return record(db, error_reply)
+        return run_transaction(record_error)
