@@ -3,6 +3,7 @@ import { getOwnerHistory, sendOwnerRequest } from '../../api/client.js';
 import SettingsPanel from '../setup/SettingsPanel.jsx';
 import ConversationsPage from '../inbox/ConversationsPage.jsx';
 import OrdersPage from '../orders/OrdersPage.jsx';
+import AgentActivityPage from './AgentActivityPage.jsx';
 
 const conversationKey = (ownerId) => `shopsync-uc2-conversation-id:${ownerId}`;
 const EXAMPLES = [
@@ -158,11 +159,12 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
           <button type="button" aria-current={page === 'assistant' ? 'page' : undefined} onClick={() => navigate('assistant')}>Owner chat</button>
           <button type="button" aria-current={page === 'inbox' ? 'page' : undefined} onClick={() => navigate('inbox')}>Customer inbox</button>
           <button type="button" aria-current={page === 'orders' ? 'page' : undefined} onClick={() => navigate('orders')}>Orders</button>
+          <button type="button" aria-current={page === 'activity' ? 'page' : undefined} onClick={() => navigate('activity')}>Agent activity</button>
         </nav>
         <section className="intro" aria-labelledby="page-title">
-          <div className="eyebrow">{settingsOpen ? 'OWNER SETTINGS' : page === 'inbox' ? 'CUSTOMER CONVERSATIONS' : page === 'orders' ? 'ORDER MANAGEMENT' : 'AGENT ORCHESTRATION'}</div>
-          <h1 id="page-title">{settingsOpen ? 'Set up your brand.' : page === 'inbox' ? 'Talk with your customers.' : page === 'orders' ? 'Manage your orders.' : 'Ask your business a question.'}</h1>
-          <p>{settingsOpen ? 'Update your business profile and choose the agents available to answer owner requests.' : page === 'inbox' ? 'See customer messages, take over a conversation and try the local simulator.' : page === 'orders' ? 'Create products and orders, check risk holds and review return requests.' : 'Your request is routed to available agent handlers, and their results come back in one answer.'}</p>
+          <div className="eyebrow">{settingsOpen ? 'OWNER SETTINGS' : page === 'inbox' ? 'CUSTOMER CONVERSATIONS' : page === 'orders' ? 'ORDER MANAGEMENT' : page === 'activity' ? 'AUTOMATIC COORDINATION' : 'AGENT ORCHESTRATION'}</div>
+          <h1 id="page-title">{settingsOpen ? 'Set up your brand.' : page === 'inbox' ? 'Talk with your customers.' : page === 'orders' ? 'Manage your orders.' : page === 'activity' ? 'See what your agents noticed.' : 'Ask your business a question.'}</h1>
+          <p>{settingsOpen ? 'Update your business profile and choose the agents available to answer owner requests.' : page === 'inbox' ? 'See customer messages, take over a conversation and try the local simulator.' : page === 'orders' ? 'Create products and orders, check risk holds and review return requests.' : page === 'activity' ? 'Follow real order and stock events from the saved ledger through the orchestrator.' : 'Your request is routed to available agent handlers, and their results come back in one answer.'}</p>
         </section>
 
         <div className="workspace-grid">
@@ -184,13 +186,13 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
 
           <section className="chat-panel" aria-label="Owner chat">
             <div className="chat-header">
-              <div><div className="panel-label">{settingsOpen ? 'ACCOUNT SETUP' : page === 'inbox' ? 'CUSTOMER SUPPORT' : page === 'orders' ? 'COMMERCE' : 'OWNER CHAT'}</div><h2>{settingsOpen ? 'Settings' : page === 'inbox' ? 'Inbox' : page === 'orders' ? 'Orders' : 'Orchestrator'}</h2></div>
+              <div><div className="panel-label">{settingsOpen ? 'ACCOUNT SETUP' : page === 'inbox' ? 'CUSTOMER SUPPORT' : page === 'orders' ? 'COMMERCE' : page === 'activity' ? 'EVENT HISTORY' : 'OWNER CHAT'}</div><h2>{settingsOpen ? 'Settings' : page === 'inbox' ? 'Inbox' : page === 'orders' ? 'Orders' : page === 'activity' ? 'Agent activity' : 'Orchestrator'}</h2></div>
               <div className="chat-header__actions">
                 <button className="button button--quiet" type="button" onClick={() => setSettingsOpen(!settingsOpen)} disabled={busy || savingSettings}>{settingsOpen ? 'Back to workspace' : 'Settings'}</button>
                 {!settingsOpen && page === 'assistant' && <button className="button button--quiet" type="button" onClick={resetConversation} disabled={busy}>New chat</button>}
               </div>
             </div>
-            {settingsOpen ? <SettingsPanel token={token} onProfileSaved={onProfileSaved} onSavingChange={setSavingSettings} /> : page === 'inbox' ? <ConversationsPage token={token} /> : page === 'orders' ? <OrdersPage token={token} /> : <>
+            {settingsOpen ? <SettingsPanel token={token} onProfileSaved={onProfileSaved} onSavingChange={setSavingSettings} /> : page === 'inbox' ? <ConversationsPage token={token} /> : page === 'orders' ? <OrdersPage token={token} /> : page === 'activity' ? <AgentActivityPage token={token} /> : <>
               {notice && <div className="notice" role="alert">{notice}</div>}
               <div className="chat-messages" aria-live="polite" aria-busy={busy || loadingHistory}>
               {loadingHistory && <div className="loading">Loading saved conversation…</div>}
@@ -198,7 +200,7 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
                 <div className="empty-chat">
                   <div className="empty-chat__icon" aria-hidden="true">✦</div>
                   <h3>What would you like to know?</h3>
-                  <p>Try a synthetic request, or ask about the saved demonstration products and orders.</p>
+                  <p>Ask about products, stock or orders saved in your local brand workspace.</p>
                   <div className="prompt-list">
                     {EXAMPLES.map((example) => <button type="button" key={example} onClick={() => setMessage(example)}>{example}<span aria-hidden="true">↗</span></button>)}
                   </div>
@@ -214,7 +216,7 @@ export default function OwnerChatPage({ session, onLogout, onProfileSaved }) {
                 <textarea id="owner-message" rows="2" maxLength="2000" value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!busy && !loadingHistory) event.currentTarget.form?.requestSubmit(); } }} placeholder="Ask about your products, stock, or orders…" disabled={busy || loadingHistory} />
                 <button type="submit" className="button button--primary" disabled={!message.trim() || busy || loadingHistory}>Send <span aria-hidden="true">↗</span></button>
               </div>
-              <div className="composer__hint">Enter to send · Shift+Enter for a new line · Results use saved demonstration data</div>
+              <div className="composer__hint">Enter to send · Shift+Enter for a new line · Results use saved local data</div>
               </form>
             </>}
           </section>

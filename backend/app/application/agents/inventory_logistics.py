@@ -58,3 +58,12 @@ def on_demand_spike(event: dict) -> dict:
         "status": "observed_demo_only",
         "note": "Demand signal received. Reorder forecasting is not implemented yet.",
     }
+
+
+def on_order_change(event: dict) -> dict:
+    """Acknowledge an actual order's effect on stock, without mutating stock."""
+    return {
+        "agent": CODE,
+        "status": "observed",
+        "note": "Order change recorded; stock was updated in the order ledger. No shipment or reorder was created.",
+    }

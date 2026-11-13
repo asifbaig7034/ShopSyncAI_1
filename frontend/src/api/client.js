@@ -103,6 +103,10 @@ export function getOwnerHistory({ token, conversationId }) {
   return request(`/api/owner/chat/history?conversation_id=${encodeURIComponent(conversationId)}`, token);
 }
 
+export function getAgentEvents(token) {
+  return request('/api/owner/events', token);
+}
+
 // Customer inbox (UC-3). All owner endpoints reuse the UC-1 session token.
 export function getConversations(token) {
   return request('/api/conversations', token);

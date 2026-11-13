@@ -6,6 +6,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
+from .agent_outbox import queue_agent_event
 from .db import connect, transaction
 
 
@@ -64,6 +65,29 @@ def queue_message(db, phone, body):
                (uid(), phone, body, "PENDING", now(), now()))
 
 
+def _low_stock_threshold():
+    return max(1, int(os.getenv("SHOPSYNC_LOW_STOCK_THRESHOLD", "5")))
+
+
+def _queue_low_stock_crossing(db, product, previous_quantity, new_quantity, *, order_id):
+    threshold = _low_stock_threshold()
+    if previous_quantity >= threshold > new_quantity:
+        queue_agent_event(db, "stock.low", product["id"], {
+            "product_id": product["id"], "sku": product["sku"],
+            "stock_quantity": new_quantity, "threshold": threshold,
+            "order_id": order_id,
+        })
+
+
+def _queue_stock_replenished(db, product, quantity, *, order_id=None):
+    queue_agent_event(db, "stock.replenished", product["id"], {
+        "product_id": product["id"], "quantity": quantity,
+        "previous_stock": product["stock_qty"],
+        "stock_quantity": product["stock_qty"] + quantity,
+        "order_id": order_id,
+    })
+
+
 def customer(db, phone, name=None, inbound=False):
     phone = phone_number(phone)
     row = db.execute("SELECT * FROM customers WHERE phone=?", (phone,)).fetchone()
@@ -100,11 +124,15 @@ def restock_product(product_id, quantity):
     if quantity <= 0:
         raise OrderError("Restock quantity must be positive.")
     with transaction() as db:
+        product = db.execute("SELECT id,stock_qty FROM products WHERE id=?", (product_id,)).fetchone()
+        if product is None:
+            raise OrderError("Product not found.", 404)
         result = db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
                             (quantity, product_id))
         if not result.rowcount:
             raise OrderError("Product not found.", 404)
         log(db, None, "owner", "manual_restock", product_id=product_id, quantity=quantity)
+        _queue_stock_replenished(db, product, quantity)
         return dict(db.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone())
 
 
@@ -240,16 +268,27 @@ def _risk(db, order):
 def _book(db, order, actor):
     # Caller owns BEGIN IMMEDIATE. Order + inventory + sale commit or roll back together.
     for item in db.execute("SELECT * FROM order_items WHERE order_id=?", (order["id"],)):
+        product = db.execute("SELECT id,sku,stock_qty FROM products WHERE id=?", (item["product_id"],)).fetchone()
+        if product is None:
+            raise OrderError(f"Product {item['sku']} is no longer available.", 409)
         result = db.execute("UPDATE products SET stock_qty=stock_qty-? WHERE id=? AND stock_qty>=?",
                             (item["quantity"], item["product_id"], item["quantity"]))
         if result.rowcount != 1:
             raise OrderError(f"Insufficient stock for {item['sku']}; order remains unconfirmed.", 409)
         db.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?)",
                    (uid(), order["id"], item["product_id"], "CONFIRM", -item["quantity"], now()))
+        _queue_low_stock_crossing(
+            db, product, product["stock_qty"], product["stock_qty"] - item["quantity"],
+            order_id=order["id"],
+        )
     db.execute("INSERT INTO financial_entries VALUES(?,?,?,?,?)",
                (uid(), order["id"], "SALE", order["total_cents"], now()))
     db.execute("UPDATE orders SET status='CONFIRMED',updated_at=? WHERE id=?", (now(), order["id"]))
     log(db, order["id"], actor, "order_confirmed")
+    queue_agent_event(db, "order.confirmed", order["id"], {
+        "order_id": order["id"], "status": "CONFIRMED", "channel": order["channel"],
+        "total_cents": order["total_cents"],
+    })
 
 
 def _confirm(db, order_id, actor, requester_phone=None):
@@ -266,6 +305,10 @@ def _confirm(db, order_id, actor, requester_phone=None):
         db.execute("INSERT INTO approvals(id,order_id,action,status,created_at) VALUES(?,?,?,?,?)",
                    (uid(), order_id, "HIGH_RISK_ORDER", "PENDING", now()))
         log(db, order_id, actor, "risk_hold", score=score, reasons=reasons)
+        queue_agent_event(db, "risk.held", order_id, {
+            "order_id": order_id, "status": "RISK_HOLD", "risk_score": score,
+            "reasons": reasons,
+        })
     else:
         _book(db, order, actor)
     return order_view(db, order_id)
@@ -305,10 +348,12 @@ def _cancel(db, order_id, actor, requester_phone=None):
         raise OrderError("Only an unshipped order can be cancelled.", 409)
     if order["status"] == "CONFIRMED":
         for item in order["items"]:
+            product = db.execute("SELECT id,stock_qty FROM products WHERE id=?", (item["product_id"],)).fetchone()
             db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
                        (item["quantity"], item["product_id"]))
             db.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?)",
                        (uid(), order_id, item["product_id"], "CANCEL", item["quantity"], now()))
+            _queue_stock_replenished(db, product, item["quantity"], order_id=order_id)
         db.execute("INSERT INTO financial_entries VALUES(?,?,?,?,?)",
                    (uid(), order_id, "CANCELLATION", -order["total_cents"], now()))
     db.execute("UPDATE orders SET status='CANCELLED',cancelled_reason='Requested by customer or owner',updated_at=? WHERE id=?",
@@ -316,6 +361,10 @@ def _cancel(db, order_id, actor, requester_phone=None):
     db.execute("UPDATE approvals SET status='CANCELLED',decided_at=? WHERE order_id=? AND status='PENDING'",
                (now(), order_id))
     log(db, order_id, actor, "order_cancelled")
+    queue_agent_event(db, "order.cancelled", order_id, {
+        "order_id": order_id, "status": "CANCELLED",
+        "stock_restored": order["status"] == "CONFIRMED",
+    })
     if actor == "owner" and order["channel"] == "whatsapp":
         queue_message(db, order["customer_phone"], f"Order {order_id} has been cancelled.")
     return order_view(db, order_id)
@@ -414,10 +463,12 @@ def receive_return(request_id, accept, reason=""):
             raise OrderError("A reason is required when rejecting a returned item.")
         if accept:
             for item in order["items"]:
+                product = db.execute("SELECT id,stock_qty FROM products WHERE id=?", (item["product_id"],)).fetchone()
                 db.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",
                            (item["quantity"], item["product_id"]))
                 db.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?)",
                            (uid(), order["id"], item["product_id"], "RETURN", item["quantity"], now()))
+                _queue_stock_replenished(db, product, item["quantity"], order_id=order["id"])
             _refund_entry(db, order)
         status = "COMPLETED" if accept else "REJECTED_AFTER_INSPECTION"
         db.execute("UPDATE return_requests SET status=?,owner_reason=?,received_at=? WHERE id=?",

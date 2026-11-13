@@ -29,3 +29,16 @@ Public status has `status` (`not_connected`, `meta_read_verified`, or
 the access token or its ciphertext. A `meta_read_verified` status proves only
 that Meta allowed this token to list that phone number at the time shown;
 message sending and webhook verification are UC-3 work.
+
+## UC-2 real agent activity (Business Owner only)
+
+| Method and path | Request | Result |
+| --- | --- | --- |
+| `GET /api/owner/events` | Real UC-1 owner bearer session | Drains due UC-4 events, then returns the latest 30 real order/stock event records and the count still queued for retry. Synthetic demo events are excluded. |
+
+Each event includes its type, status (`coordinated`, `unhandled`, or a
+skipped/failed subscriber status), supported agent acknowledgements, and
+privacy-limited details such as an order or product ID. Events are generated
+only from committed UC-4 transactions; this endpoint does not execute any
+refund, customer message, or price change. The older
+`GET /api/owner/demo-events` remains synthetic-only.

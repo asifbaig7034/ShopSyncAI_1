@@ -94,8 +94,19 @@ def initialize():
           next_attempt_at TEXT NOT NULL, provider_id TEXT, last_error TEXT,
           created_at TEXT NOT NULL
         );
+        -- Agent events are saved with the order transaction, then delivered
+        -- separately to Mongo. This is distinct from the WhatsApp outbox.
+        CREATE TABLE IF NOT EXISTS agent_event_outbox (
+          event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
+          aggregate_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'PENDING',
+          attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+          next_attempt_at TEXT NOT NULL,
+          created_at TEXT NOT NULL, delivered_at TEXT
+        );
         CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, next_attempt_at);
+        CREATE INDEX IF NOT EXISTS idx_agent_events_pending ON agent_event_outbox(status, next_attempt_at, created_at);
         """)
         # A process killed during a send can leave a lease behind. Its status is
         # unknown; an operator can inspect and retry it, avoiding an automatic duplicate.

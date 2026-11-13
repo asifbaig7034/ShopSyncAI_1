@@ -13,7 +13,10 @@ from time import time
 from bson import ObjectId
 
 from ..agents import customer_commerce, inventory_logistics
-from .event_types import DEMAND_SPIKE, FRAUD_FLAG, LOW_STOCK
+from .event_types import (
+    DEMAND_SPIKE, FRAUD_FLAG, LOW_STOCK, ORDER_CANCELLED,
+    ORDER_CONFIRMED, RISK_HELD, STOCK_REPLENISHED,
+)
 from .outbox import save_event
 
 
@@ -23,8 +26,17 @@ EventHandler = Callable[[dict], dict]
 SUBSCRIPTIONS: dict[str, dict[str, EventHandler]] = {
     LOW_STOCK: {customer_commerce.CODE: customer_commerce.on_low_stock},
     DEMAND_SPIKE: {inventory_logistics.CODE: inventory_logistics.on_demand_spike},
+    ORDER_CONFIRMED: {inventory_logistics.CODE: inventory_logistics.on_order_change},
+    ORDER_CANCELLED: {inventory_logistics.CODE: inventory_logistics.on_order_change},
+    STOCK_REPLENISHED: {customer_commerce.CODE: customer_commerce.on_stock_replenished},
 }
-EVENT_TYPES = frozenset({LOW_STOCK, DEMAND_SPIKE, FRAUD_FLAG})
+# The risk.held event has an owner-facing record, but no automated Risk & Trust
+# subscriber until UC-9 is implemented. Real order/stock subscribers are
+# read-only and never trigger messages, refunds, or stock changes.
+EVENT_TYPES = frozenset({
+    LOW_STOCK, DEMAND_SPIKE, FRAUD_FLAG, ORDER_CONFIRMED,
+    ORDER_CANCELLED, RISK_HELD, STOCK_REPLENISHED,
+})
 
 
 def publish_event(
@@ -69,12 +81,23 @@ def publish_event(
         return created
     event = db.system_events.find_one({"event_id": event_id, "owner_id": owner_id})
     acknowledged = {row.get("agent") for row in event.get("agent_responses", []) if isinstance(row, dict)}
+    skipped = set(event.get("skipped_agents") or [])
     failed: list[str] = []
     for code in event.get("target_agents", []):
-        if code in acknowledged:
+        if code in acknowledged or code in skipped:
             continue
         handler = subscribers.get(code)
-        if not enabled.get(code, False) or handler is None:
+        if not enabled.get(code, False):
+            # Owner changed the toggle after this event was first recorded.
+            # Do not delay every retry forever or run this old event later
+            # merely because the owner enables the agent again.
+            skipped.add(code)
+            db.system_events.update_one(
+                {"event_id": event_id, "owner_id": owner_id},
+                {"$addToSet": {"skipped_agents": code}},
+            )
+            continue
+        if handler is None:
             failed.append(code)
             continue
         try:
@@ -92,7 +115,12 @@ def publish_event(
         except Exception:
             # Keep internal errors out of the event record and Owner's view.
             failed.append(code)
-    status = "subscriber_failed" if failed else ("coordinated" if event.get("target_agents") else "unhandled")
+    status = (
+        "subscriber_failed" if failed else
+        "partially_coordinated" if skipped and acknowledged else
+        "skipped_disabled" if skipped else
+        "coordinated" if event.get("target_agents") else "unhandled"
+    )
     db.system_events.update_one(
         {"event_id": event_id, "owner_id": owner_id},
         {"$set": {"status": status, "failed_agents": failed}},

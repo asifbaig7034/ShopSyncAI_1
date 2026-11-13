@@ -1,20 +1,23 @@
-# ShopSync AI - UC-1 owner account and UC-2 orchestrator prototype
+# ShopSync AI - owner account, orchestrator, customer inbox and orders
 
-The UC-3 customer inbox and UC-4 orders are being integrated with this owner
-app. See [the UC-3/UC-4 integration checkpoint](docs/uc3-uc4-integration.md)
-for the local demo flow and current limits.
+The owner app includes UC-3 customer inbox and UC-4 orders. See
+[the integration checkpoint](docs/uc3-uc4-integration.md) for the local
+demo flow and [real agent events](docs/uc2-real-events.md) for how committed
+order and stock changes reach UC-2.
 
 This repository implements **UC-2, Send Request to Orchestrator**, and the
 UC-1 owner-account flows (signup, login, logout, settings and password recovery). The Business Owner
 types a natural-language request into a small React chat. FastAPI checks an
 expiring owner session (or the older local-only demo token for verification), identifies relevant enabled handlers,
-obtains sample data-backed results, and displays one combined answer. Owner
-requests, responses, approval proposals, and agent events are recorded in the
-shared data layer. Customer WhatsApp, order execution, shipping, payments,
-social publishing, and later UC-1/UC-3-UC-10 features are not implemented
-here. Staff accounts, Instagram, Facebook, courier and payment integrations
-are later UC-1 steps. WhatsApp account read access can now be verified; this
-does not activate WhatsApp customer messaging or webhooks.
+obtains saved data-backed results, and displays one combined answer. Owner
+requests, responses, approval proposals, and agent events are recorded in
+MongoDB. UC-4 order/product writes use a separate SQLite ledger; a
+transactional SQLite event outbox delivers committed order/stock changes to
+MongoDB with retries. Live customer WhatsApp sending, shipping, payments,
+social publishing, and the remaining specialist agents are later work. Staff
+accounts, Instagram, Facebook, courier and payment integrations are later
+UC-1 steps. WhatsApp account read access can now be verified; this does not
+activate WhatsApp customer messaging or webhooks.
 
 The owner can edit the brand name, contact, currency and preferred language in
 **Settings**, and turn the two working read-only agents on or off. Settings
@@ -24,10 +27,11 @@ Currency and language are saved as preferences for later flows; changing the
 currency does not convert existing demo product/order prices or the current
 agent replies, which still display their stored PKR amounts.
 
-The two working **demo** domains are Customer & Commerce (saved sample orders)
-and Supply Chain & Operations (sample products and stock). The eventual architecture
-has six specialist agents. A report from a demo agent is still based on stored
-sample records; it is not a live external integration.
+The two working read-only domains are Customer & Commerce (saved orders)
+and Supply Chain & Operations (saved products and stock). They use the UC-4
+ledger for a real owner and seeded sample data for the older local demo owner.
+The eventual architecture has six specialist agents. These two domains do
+not send live external messages or make business changes.
 
 ## Requirements
 

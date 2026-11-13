@@ -144,3 +144,32 @@ def test_unimplemented_or_disabled_subscribers_never_claim_coordination(demo):
                          details={"fictional_order_count": 12}) is True
     disabled = db.system_events.find_one({"event_id": "fictional-disabled-target"})
     assert disabled["status"] == "unhandled" and disabled["target_agents"] == []
+
+
+def test_subscriber_disabled_after_failure_is_skipped_without_replay(demo):
+    _client, db, sample, _headers = demo
+    calls = []
+
+    def temporarily_failed(_event):
+        calls.append(True)
+        raise RuntimeError("the owner must not see this detail")
+
+    request = dict(
+        owner_id=sample["owner_id"], event_id="fictional-disable-after-recording",
+        event_type=DEMAND_SPIKE, source="customer_commerce",
+        details={"fictional_order_count": 12},
+        handlers={"inventory_logistics": temporarily_failed},
+    )
+    assert publish_event(db, **request) is True
+    db.owners.update_one({"_id": ObjectId(sample["owner_id"])},
+                         {"$set": {"agent_settings.inventory_logistics": False}})
+    assert publish_event(db, **request) is False
+    event = db.system_events.find_one({"event_id": request["event_id"]})
+    assert event["status"] == "skipped_disabled"
+    assert event["skipped_agents"] == ["inventory_logistics"]
+    assert event["agent_responses"] == []
+    assert len(calls) == 1
+    db.owners.update_one({"_id": ObjectId(sample["owner_id"])},
+                         {"$set": {"agent_settings.inventory_logistics": True}})
+    assert publish_event(db, **request) is False
+    assert len(calls) == 1

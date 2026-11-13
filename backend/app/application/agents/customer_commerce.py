@@ -44,9 +44,24 @@ def handle(db, owner_id: str, intent: str, message: str) -> str:
 
 
 def on_low_stock(event: dict) -> dict:
-    """Read-only FYP-1 subscriber: acknowledge an event; never message a customer."""
+    """Acknowledge inventory change without messaging a customer."""
+    if event.get("event_id", "").startswith("uc4:"):
+        return {
+            "agent": CODE,
+            "status": "observed",
+            "note": "Low stock recorded; customer replies must consult current inventory. No customer message was sent.",
+        }
     return {
         "agent": CODE,
         "status": "observed_demo_only",
         "note": "Low-stock event received. Customer recommendations are not implemented yet.",
+    }
+
+
+def on_stock_replenished(event: dict) -> dict:
+    """Acknowledge restored inventory; customer-facing replies still use live stock."""
+    return {
+        "agent": CODE,
+        "status": "observed",
+        "note": "Stock replenishment recorded; current inventory is available to customer replies. No customer message was sent.",
     }
