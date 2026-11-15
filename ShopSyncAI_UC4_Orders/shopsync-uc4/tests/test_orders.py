@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from app import db as persistence
 
 from app import service, whatsapp
+from app.delivery import handle_delivery_status
 from app.main import app
 
 
@@ -470,6 +471,106 @@ class OrderFlowTests(unittest.TestCase):
         asyncio.run(whatsapp.send_due())
         self.assertEqual(persistence.get_store().count("orders"), 1)
         self.assertEqual(persistence.get_store().all("outbox")[0]["status"], "NEEDS_CONFIGURATION")
+
+    def test_owner_whatsapp_confirmation_notifies_once(self):
+        service.chat("owner-live-order", "923001234567", "ORDER TEE-01 1 | Lahore | COD", live=True)
+        order = service.list_orders()[0]
+        before = persistence.get_store().count("outbox")
+        self.call("POST", f"/api/orders/{order['id']}/confirm")
+        self.assertEqual(persistence.get_store().count("outbox"), before + 1)
+        self.call("POST", f"/api/orders/{order['id']}/confirm")
+        self.assertEqual(persistence.get_store().count("outbox"), before + 1)
+        self.assertEqual(self.stock(), 1)
+
+    def test_source_key_snapshot_preserves_retry_and_rejects_changed_payload(self):
+        key = uuid.uuid4().hex
+        order = self.draft(key=key)
+        self.call("PATCH", f"/api/orders/{order['id']}/draft", {
+            "items": [{"product_id": self.product["id"], "quantity": 1}],
+            "delivery_address": "Changed address", "payment_method": "BANK_TRANSFER"})
+        self.assertEqual(self.draft(key=key)["id"], order["id"])
+        self.call("POST", "/api/orders/drafts", {
+            "phone": "923001234567", "name": "Test customer", "delivery_address": "Different request",
+            "payment_method": "COD", "items": [{"product_id": self.product["id"], "quantity": 1}],
+            "source_key": key}, 409)
+        self.assertEqual(persistence.get_store().count("orders"), 1)
+
+    def test_rejected_refund_repeat_reports_saved_decision(self):
+        order = self.draft()
+        service.confirm(order["id"])
+        command = f"REFUND {order['id']} Wrong item"
+        service.chat("refund-repeat-one", "923001234567", command)
+        request_id = service.get_order(order["id"])["return_request"]["id"]
+        service.decide_return(request_id, False, "Outside policy")
+        reply = service.chat("refund-repeat-two", "923001234567", command)
+        self.assertIn("rejected", reply)
+        self.assertIn("Outside policy", reply)
+        self.assertNotIn("pending owner review", reply)
+        self.assertEqual(persistence.get_store().count("return_requests"), 1)
+        self.assertEqual(service.financial_summary()["booked_net_cents"], 150000)
+
+    def test_completed_refund_repeat_explains_manual_payment(self):
+        order = self.draft()
+        service.confirm(order["id"])
+        command = f"REFUND {order['id']} Wrong item"
+        service.chat("refund-complete-one", "923001234567", command)
+        request_id = service.get_order(order["id"])["return_request"]["id"]
+        service.decide_return(request_id, True, "")
+        reply = service.chat("refund-complete-two", "923001234567", command)
+        self.assertIn("completed", reply)
+        self.assertIn("pending manual action", reply)
+        self.assertEqual(persistence.get_store().count("financial_entries", {"kind": "REFUND"}), 1)
+
+    def post_status(self, value, phone_id="12345"):
+        os.environ["WA_APP_SECRET"] = "offline-test-signing"
+        os.environ["WA_PHONE_NUMBER_ID"] = "12345"
+        body = json.dumps({"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
+            "metadata": {"phone_number_id": phone_id}, "statuses": [value]}}]}]}).encode()
+        signature = "sha256=" + hmac.new(b"offline-test-signing", body, hashlib.sha256).hexdigest()
+        response = self.client.post("/webhooks/whatsapp", content=body,
+                                    headers={"x-hub-signature-256": signature})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_delivery_failure_callback_preserves_order_and_deduplicates(self):
+        order = self.draft()
+        service.confirm(order["id"])
+        service.chat("receipt-test", "923001234567", "HELP", live=True)
+        claimed = whatsapp.claim_due()
+        whatsapp.finish(claimed, status="ACCEPTED", provider_id="wamid.receipt")
+        value = {"id": "wamid.receipt", "status": "failed", "timestamp": "1730000000",
+                 "recipient_id": "923001234567", "errors": [{"code": 131000}]}
+        self.assertEqual(self.post_status(value)["statuses_processed"], 1)
+        row = persistence.get_store().get("outbox", {"_id": claimed["_id"]})
+        self.assertEqual(row["status"], "FAILED")
+        self.post_status(value)
+        again = persistence.get_store().get("outbox", {"_id": claimed["_id"]})
+        self.assertEqual(again["next_attempt_at"], row["next_attempt_at"])
+        self.assertEqual(persistence.get_store().count("delivery_events"), 1)
+        self.assertEqual(self.stock(), 1)
+        self.assertEqual(service.financial_summary()["booked_net_cents"], 150000)
+        self.assertEqual(service.get_order(order["id"])["status"], "CONFIRMED")
+
+    def test_delivery_before_http_mapping_is_reconciled_in_transaction(self):
+        service.chat("receipt-early-test", "923001234567", "HELP", live=True)
+        claimed = whatsapp.claim_due()
+        result = handle_delivery_status({"id": "wamid.early", "status": "failed",
+                                         "timestamp": "1730000000", "errors": [{"code": 131000}]})
+        self.assertEqual(result["outcome"], "WAITING_FOR_MESSAGE")
+        whatsapp.finish(claimed, status="ACCEPTED", provider_id="wamid.early")
+        row = persistence.get_store().get("outbox", {"_id": claimed["_id"]})
+        self.assertEqual(row["status"], "FAILED")
+        self.assertTrue(persistence.get_store().all("delivery_events")[0]["applied"])
+
+    def test_other_business_number_status_is_ignored(self):
+        service.chat("other-number-test", "923001234567", "HELP", live=True)
+        claimed = whatsapp.claim_due()
+        whatsapp.finish(claimed, status="ACCEPTED", provider_id="wamid.other")
+        result = self.post_status({"id": "wamid.other", "status": "delivered",
+                                   "timestamp": "1730000000"}, phone_id="different-number")
+        self.assertEqual(result["statuses_processed"], 0)
+        self.assertEqual(persistence.get_store().get("outbox", {"_id": claimed["_id"]})["status"], "ACCEPTED")
+        self.assertEqual(persistence.get_store().count("delivery_events"), 0)
 
 
 if __name__ == "__main__":

@@ -2,13 +2,15 @@
 
 UC-4 is a separately runnable order module using **Python, FastAPI and MongoDB through PyMongo**. Products, customers, orders, stock movements, refund records, audit events and notifications now use MongoDB. SQLite is used only by the optional read-only importer for your older demo database.
 
+**Applying the 15 November update? Use [UPDATE_IN_PLACE.md](UPDATE_IN_PLACE.md), then [FIXES_CHECKLIST.md](FIXES_CHECKLIST.md) to verify the five fixes.**
+
 **Start with [SETUP_WINDOWS.md](SETUP_WINDOWS.md).** It explains how to keep the same working folder and environment, connect MongoDB and preserve previous orders. [PROGRESS.md](PROGRESS.md) records verified and pending work. [MONGODB_SCHEMA.md](MONGODB_SCHEMA.md) describes collections and IDs for integration.
 
 Requires Python 3.10+ and a transaction-capable MongoDB deployment. On a fresh Git clone without an environment, run `py -3 -m venv .venv` once before installing requirements. An existing working folder reuses its current environment.
 
 ## Update the same folder
 
-Stop Uvicorn with Ctrl+C. Copy updated code into the existing team-repository shopsync-uc4 folder and replace code files. Keep the existing .venv, .env and data directory. Install the new MongoDB dependencies once:
+Stop Uvicorn with Ctrl+C. Copy updated code into the existing team-repository shopsync-uc4 folder and replace code files. Keep the existing .venv, .env, data and .git directory. Dependencies are unchanged from the preceding MongoDB version, so this update alone does not require a new environment or package reinstall. If upgrading from SQLite or resolving missing packages, install once:
 
     .\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
 
@@ -85,7 +87,7 @@ On Linux/macOS, activate the existing environment and run equivalent python -m p
 
 An active/completed return or refund prevents cancellation from reversing the same sale again. Actual bank/gateway transfer remains manual.
 
-The simulator accepts one SKU per order. The owner API supports 1–25 distinct products. Commands are ORDER, EDIT, CONFIRM, STATUS, CANCEL, RETURN and REFUND using the formats shown in the screen.
+The simulator and owner create form accept one SKU per order; the owner API supports 1–25 distinct products. On a multi-item draft the dashboard explicitly edits the first item and delivery/payment details, preserving every other item. Selecting a SKU already on another line is refused instead of silently dropping/combining items. Commands are ORDER, EDIT, CONFIRM, STATUS, CANCEL, RETURN and REFUND using the formats shown in the screen.
 
 ## Risk and eligibility
 
@@ -103,19 +105,37 @@ For a risk demo set amount to 100000 in .env and restart. A PKR 1500 order shoul
 
     .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
-The generation run passed **16 offline domain checks and 6 offline migration checks**. These do not prove MongoDB transaction behavior. Real integration tests are explicitly skipped when TEST_MONGODB_URI is unset. To verify a real deployment, set that variable to a development replica-set/Atlas URI and run:
+Offline domain, importer, diagnostic and provider-mock tests check behavior without a real MongoDB server or WhatsApp send. Their evidence does not establish MongoDB transaction behavior or live transport delivery. Current verification results are recorded in PROGRESS.md. Real integration tests are explicitly skipped when TEST_MONGODB_URI is unset. To verify a real deployment, set that variable to a development replica-set/Atlas URI and run:
 
     .\.venv\Scripts\python.exe -m scripts.run_mongo_tests
 
-The runner requires a configured URI, refuses a result containing skipped tests and uses temporary test databases. The live suite currently contains 25 order/API cases plus 2 migration cases, including concurrent confirmation, cancellation/refund races and delivery leases. Use a development test user permitted to create/drop those databases.
+The runner requires a configured URI, refuses a result containing skipped tests and uses temporary test databases. The live suite covers order/API operations, migration, concurrent confirmation, cancellation/refund races, delivery leases and signed status callbacks. Use a development test user permitted to create/drop those databases.
 
-**Live MongoDB integration tests were not executed in the generation environment:** MongoDB/PyMongo were unavailable and downloads were blocked. The old SQLite version's 13 passing tests are historical, not proof of MongoDB concurrency or live WhatsApp delivery. Current evidence is recorded in PROGRESS.md.
+**Live MongoDB integration tests were not executed in the generation environment:** MongoDB/PyMongo were unavailable and downloads were blocked. Earlier SQLite results are historical, not proof of MongoDB concurrency or live WhatsApp delivery. Current evidence is recorded in PROGRESS.md.
+
+For the browser regression tests, install Node.js only if you want to run these tests, then run:
+
+    node --test tests/ui_orders.test.cjs
+
+Node.js is not required to run this FastAPI app. These tests exercise UI logic with mocked HTTP, not a live browser/server/provider.
+
+## Changes in this update
+
+- Multi-item draft editing retains non-edited product lines and quantities.
+- Draft submission preserves its complete source-key/payload after an uncertain response, including a same-tab reload, so retry does not create another order. Changing the payload with an already-used source key returns HTTP 409. The pending-draft sessionStorage entry contains customer/address/item data and a retry key, not an authentication token; the existing demo token is stored separately.
+- Owner confirmation of a WhatsApp-channel draft now queues one confirmation or risk-hold response. Repeating confirmation queues no extra copy. Simulator-channel orders do not pretend to send WhatsApp notifications.
+- Repeating an identical return/refund request as a new message reports the saved current decision; a completed accounting adjustment says actual payment remains manual.
+- Signed WhatsApp status receipts update outbox delivery state and classify failed delivery; duplicate/late receipts and receipts received before provider-ID mapping are handled separately from order/finance mutations.
 
 ## Optional WhatsApp
 
 Configure WA_ACCESS_TOKEN, WA_PHONE_NUMBER_ID, WA_GRAPH_VERSION, WA_APP_SECRET and WA_VERIFY_TOKEN on the server. No provider credentials are included.
 
-Register GET/POST https://YOUR_PUBLIC_HOST/webhooks/whatsapp. POST verifies X-Hub-Signature-256. Inbound IDs are deduplicated and checked against sender identity. The MongoDB outbox claims a lease, sends outside the order transaction and records status/retries. Ambiguous/interrupted sends become UNCERTAIN for review. Approved-template delivery outside the customer service window remains an integration handoff.
+Register GET/POST https://YOUR_PUBLIC_HOST/webhooks/whatsapp. POST verifies X-Hub-Signature-256. If WA_PHONE_NUMBER_ID is configured, payload metadata must match that number. Inbound IDs are deduplicated and checked against sender identity. The response reports processed incoming messages and statuses_processed separately; a counted receipt is not proof of delivery.
+
+The transactional outbox worker sends external HTTP outside the order transaction. A returned provider message ID produces ACCEPTED; signed sent/delivered/read callbacks produce SENT, DELIVERED or READ. Known temporary failures retry automatically up to five total attempts; permanent/unknown failures require MANUAL_REVIEW, account/configuration failures use NEEDS_CONFIGURATION and expired messaging windows use NEEDS_TEMPLATE. Ambiguous/interrupted sends use UNCERTAIN.
+
+Delivery receipts are deduplicated in delivery_events. Unmatched receipts wait for provider-ID mapping and are reconciled later. Delivered/read evidence from any known attempt stops queued automatic retries; old sent/failed receipts cannot downgrade newer state. Do not interpret ACCEPTED as a delivered message. Approved-template delivery remains an integration handoff.
 
 ## API map
 

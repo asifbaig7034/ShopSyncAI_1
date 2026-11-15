@@ -4,9 +4,9 @@ Aap apna **wahi existing shopsync-uc4 folder** use karein. Is update ke liye nay
 
 ## 1. Updated code aur packages
 
-Updated files current shopsync-uc4 mein copy/replace karein. Apne existing .venv, .env aur data ko rehne dein. VS Code mein isi folder ko kholein; requirements.txt nazar aani chahiye.
+Is update ke liye [UPDATE_IN_PLACE.md](UPDATE_IN_PLACE.md) follow karein: code-only ZIP se files current shopsync-uc4 mein copy/replace karein. Apne existing .venv, .env, data aur .git ko rehne dein. VS Code mein isi folder ko kholein; requirements.txt nazar aani chahiye.
 
-PowerShell mein ek baar:
+Agar pichla MongoDB version already chal raha hai, packages is update mein change nahi hue; dobara install zaroori nahi. SQLite version se aa rahi hain ya package missing ho to PowerShell mein ek baar:
 
     .\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
 
@@ -98,17 +98,30 @@ Plain standalone MongoDB server transactions support nahi karta. Is project ke l
 
     .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
-Asli MongoDB tests ke liye .env mein TEST_MONGODB_URI ko development replica-set/Atlas URI set karein:
+UI fixes ke liye optional Node.js test:
+
+    node --test tests/ui_orders.test.cjs
+
+Node.js sirf is UI test command ke liye chahiye, app chalane ke liye nahi. Asli MongoDB tests ke liye apni local .env mein yeh line add karein; yeh existing MONGODB_URI reuse karti hai:
+
+    TEST_MONGODB_URI="${MONGODB_URI}"
+
+Phir:
 
     .\.venv\Scripts\python.exe -m scripts.run_mongo_tests
 
-Test user ko temporary test databases create/drop karne ki permission chahiye. **Skipped tests passed nahi hote.** Generation environment mein live MongoDB test run available nahi tha; PROGRESS.md mein status diya hai.
+Test user ko temporary test databases create/drop karne ki permission chahiye. **Skipped tests passed nahi hote.** Generation environment mein live MongoDB aur real WhatsApp test run available nahi tha; PROGRESS.md mein status diya hai. Paanch review fixes ke cases FIXES_CHECKLIST.md mein hain.
 
 ## Common errors
 
 | Symptom | Kya check karein |
 | --- | --- |
 | No module named pymongo/dotenv | Existing .venv se Step 1 install command chalayein. |
+| AUTH_FAILED | Database-user username/password aur URI password encoding check karein. |
+| CONNECTION_TIMEOUT | Current IP access list, running cluster aur internet/firewall check karein. |
+| DNS_ERROR | Actual cluster hostname, internet/DNS aur cluster availability check karein. |
+| TLS_ERROR | Python certificates/system time check karein; certificate verification disable na karein. |
+| CONFIG_PLACEHOLDER | Example values ko actual Atlas URI se replace karein. |
 | Cannot connect to MongoDB | Running cluster/server, URI, database-user password aur IP access check karein. |
 | Replica set/Atlas required | Standalone server se connect hain; supported setup use karein. |
 | Target must be empty | Alag empty MONGODB_DB choose karein; existing data force-delete karke import na karein. |

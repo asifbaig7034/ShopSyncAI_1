@@ -15,7 +15,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 COLLECTIONS = (
     "products", "customers", "orders", "approvals", "return_requests",
-    "stock_movements", "financial_entries", "audit_events", "inbound_messages", "outbox",
+    "stock_movements", "financial_entries", "audit_events", "inbound_messages", "outbox", "delivery_events",
 )
 _client = None
 _settings = None
@@ -130,6 +130,10 @@ def initialize():
         ("stock_movements", [("order_id", ASCENDING), ("product_id", ASCENDING), ("kind", ASCENDING)], True),
         ("financial_entries", [("order_id", ASCENDING), ("kind", ASCENDING)], True),
         ("outbox", [("status", ASCENDING), ("next_attempt_at", ASCENDING)], False),
+        ("outbox", [("provider_id", ASCENDING)], False),
+        ("outbox", [("provider_ids", ASCENDING)], False),
+        ("delivery_events", [("provider_id", ASCENDING), ("applied", ASCENDING)], False),
+        ("delivery_events", [("applied", ASCENDING), ("next_check_at", ASCENDING)], False),
     ):
         database[name].create_index(fields, unique=unique)
     run_transaction(lambda store: store.count("products"))

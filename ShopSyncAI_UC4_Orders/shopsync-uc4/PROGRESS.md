@@ -1,63 +1,80 @@
 # UC-4 Manage Orders Progress
 
-Updated: 13 November 2026
+Updated: 15 November 2026
 
 ## Current result
 
-The runtime now uses **MongoDB through PyMongo**. SQLite is only an optional read-only import source. Python/FastAPI endpoints and the command simulator remain. The current HTML/CSS/JavaScript screen demonstrates the API; the team's React frontend still needs connecting.
+UC-4 uses Python/FastAPI and MongoDB through PyMongo. SQLite is only an optional read-only migration source. This update fixes five review findings while keeping the same API-based module and local HTML/CSS/JavaScript demonstration screen. Team React and UC-1/2/3 integration remain pending.
 
-Keep the same working folder, .venv and data. Install new requirements once. SETUP_WINDOWS.md explains connection and optional old-data migration.
+Use UPDATE_IN_PLACE.md for the code-only update and FIXES_CHECKLIST.md for verification. Preserve your actual local .env, .venv, data and .git. Dependencies are unchanged from the preceding MongoDB version.
 
-## Implementation status
+## Five review fixes
 
-| Area | Status | Evidence or boundary |
-| --- | --- | --- |
-| MongoDB persistence | Implemented | PyMongo sessions/collections/indexes; no SQLite runtime fallback |
-| Atomic order/stock/sale | Implemented; live verification pending | One transaction, conditional stock decrement and unique operation indexes |
-| Owner/customer drafts and editing | Implemented | APIs, owner form, customer commands |
-| Payment choice/full summary | Implemented | Explicit COD/BANK_TRANSFER; address/payment/items/customer/total before confirmation |
-| Rule-based risk and review | Implemented | Hold, approval stock recheck and rejection |
-| Status/cancellation | Implemented | Customer ownership check; stock/finance reversed once |
-| Return/refund decisions | Implemented | Eligibility, full-order request, approval/rejection and item inspection |
-| Rejection reason | Implemented | Required for request/inspection rejection; saved reason returned by STATUS |
-| Refund/cancellation safety | Improved | Active/completed request blocks cancellation; decisions recheck order state |
-| Sender isolation | Improved | Reused inbound ID from another sender is rejected |
-| MongoDB outbox | Implemented; live delivery pending | Atomic lease, attempt/outcome records, ambiguous/expired sends require review |
-| SQLite record import | Implemented | Read-only consistent snapshot, stable IDs/items, empty-target atomic import and verified rerun |
-| Windows/schema instructions | Documented | SETUP_WINDOWS.md, .env.example, MONGODB_SCHEMA.md |
+| Finding | Change |
+| --- | --- |
+| Multi-item UI edit could drop other lines | First-line editing now preserves every remaining product/quantity and refuses a duplicate SKU selection |
+| Ambiguous draft response could create a duplicate | UI retains the entire pending payload/source_key across retry and same-tab reload; in-flight second submit is blocked; changed payload with reused source_key returns 409 |
+| Owner confirming WhatsApp draft did not notify customer | Owner confirmation/hold queues the appropriate response once for WhatsApp-channel orders |
+| Repeated return/refund message could claim it was pending again | New-message repeat reports the stored current decision, reason and manual payment requirement |
+| Provider acceptance/failure receipts were incomplete | Transactional worker claims/finishes, ACCEPTED state, signed status callbacks, buffered/deduplicated delivery_events and failure classification |
+
+## Existing functionality retained
+
+| Area | Status or boundary |
+| --- | --- |
+| MongoDB order/customer/catalog/history | Implemented with collections, indexes and stable string IDs |
+| Confirmation, stock and booked sale | One MongoDB transaction with conditional deduction and operation uniqueness |
+| Draft/edit/payment/summary | Implemented; customer explicitly chooses COD/BANK_TRANSFER |
+| Risk hold and owner review | Explainable rules; approval rechecks stock |
+| Cancellation and return/refund | Ownership, eligibility, required rejection reasons, accepted-return stock restoration |
+| Financial safety | Active/completed return/refund blocks a second cancellation reversal |
+| Connection diagnostics | Configuration/auth/DNS/TLS/permission checks without printing URI/credentials |
+| Legacy data transfer | Read-only SQLite snapshot into empty target, IDs/history preserved |
+| Deployment/team boundaries | Single business, demo auth, full-order returns, manual payment/courier integration |
 
 ## Verification evidence and limits
 
-The older SQLite build passed 13 tests on 9 November 2026. **Those results do not verify this MongoDB migration.**
+Python offline domain, migration, diagnostic and mocked provider tests and Node UI regression tests are supplied. These cover business decisions, retry payload preservation, non-destructive editing and receipt processing without making real WhatsApp sends.
 
-The generation environment had no MongoDB server/PyMongo installation, and downloads were blocked. Live MongoDB transaction, concurrency and API integration tests **were not executed here**. **16 offline domain tests and 6 offline migration tests passed** in the generation run. These check importer/business behavior; an in-memory test cannot prove MongoDB guarantees. The real suite currently has 25 order/API cases and 2 migration cases pending execution on MongoDB, including competing confirmations, cancellation/refund races and worker leases. Python compilation and JavaScript syntax checks also passed.
+Verified on 15 November 2026: **56 Python offline/mocked checks and 10 Node UI regression tests passed** (66 total). Python discovery reported 59 entries with 3 skipped entries: the gated order/API integration module and two migration integration tests. Those represent **34 real MongoDB integration cases still to run**; skipped cases are not passing results. Python source compilation also passed.
 
-Run:
+**Live MongoDB transaction/concurrency verification and real WhatsApp transport were not executed in the generation environment.** MongoDB/PyMongo were unavailable and downloads were blocked. Earlier SQLite passing results are historical. Mocked or skipped cases must not be reported as passed live integration.
+
+Run Python checks:
 
     .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
-Use python -m scripts.check_mongodb to check the configured application connection, indexes and a real transaction. Then set TEST_MONGODB_URI to a development replica-set/Atlas URI and run:
+Run UI regression tests (Node.js is only needed for this command):
+
+    node --test tests/ui_orders.test.cjs
+
+Check the configured application database:
+
+    .\.venv\Scripts\python.exe -m scripts.check_mongodb
+
+Set TEST_MONGODB_URI to a development replica-set/Atlas URI, then run all required Python checks including real integration:
 
     .\.venv\Scripts\python.exe -m scripts.run_mongo_tests
 
-Skipped integration tests are pending, not passed. Also perform the README browser demo, check persistence after restart and test WhatsApp when credentials are available.
+The runner refuses missing test configuration or skipped cases. Temporary shopsync_uc4_test_* databases require create/drop permission; the application database is not the test target. Follow the manual/browser cases in FIXES_CHECKLIST.md and confirm persistence after a server restart.
 
-## Integration handoffs
+## Team integration handoffs
 
 | Module | Connection needed |
 | --- | --- |
-| UC-1 accounts/settings | Real owner/business permissions and delivery/risk/return settings replace demo token/configuration |
-| UC-2 orchestrator | Route requests to UC-4 APIs and use committed results |
-| UC-3 customer chat | Natural-language operations, trusted customer identity, one agreed WhatsApp receive/send path |
-| React dashboard | Connect UI to endpoints/authentication |
-| Product/inventory | Agree MongoDB collection/ID contract and one stock-update authority |
-| Finance/gateway | Consume accounting records and implement actual transfers/reconciliation |
+| UC-1 | Real owner/business authentication, permissions and delivery/risk/return settings |
+| UC-2 | Route owner requests to the UC-4 API and use committed results |
+| UC-3 | Natural-language requests, trusted customer identity and one agreed WhatsApp receive/send path |
+| React | Connect team UI to endpoints and final authentication |
+| Products/inventory | Agree collection/ID schema and one stock-update authority |
+| Finance/gateway | Consume accounting records; actual transfer/reconciliation remains separate |
 
 ## Remaining limitations
 
-- Single-business deployment; tenant authorization is not complete.
-- One full-order return/refund per order; no partial-item refunds.
-- Accounting/payment choice does not transfer money.
-- Shipment status is owner-entered; courier integration is separate.
-- Real WhatsApp credentials/public webhook/template delivery and live tests remain.
-- MongoDB schema must align with team collections; import is not a merge into populated team data.
+- Single-business deployment; full tenant authorization is not implemented.
+- One full-order return/refund per order; partial-item refund is not implemented.
+- Accounting adjustment does not move money.
+- Shipment status is owner-entered.
+- Real WhatsApp setup/public webhook, template sending and live verification remain.
+- Shared team collections/IDs need agreement; the importer does not merge into populated team data.
+- Code-only ZIP excludes .env/.venv/data/.git. Full ZIP retains the original uploaded environment/data snapshot, not current local files or Atlas records.

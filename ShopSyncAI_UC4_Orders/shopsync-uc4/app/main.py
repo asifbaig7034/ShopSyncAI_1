@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from . import service
 from .db import close_connection, initialize
+from .delivery import handle_delivery_status
 from .whatsapp import list_outbox, outbox_worker, retry_message, send_due
 
 
@@ -268,9 +269,16 @@ async def inbound_whatsapp(request: Request):
     if payload.get("object") != "whatsapp_business_account":
         raise HTTPException(status_code=400, detail="Unexpected webhook object.")
     processed = 0
+    statuses_processed = 0
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
+            expected_phone_id = os.getenv("WA_PHONE_NUMBER_ID", "").strip()
+            if expected_phone_id and value.get("metadata", {}).get("phone_number_id") != expected_phone_id:
+                continue
+            for status in value.get("statuses", []):
+                result = await asyncio.to_thread(handle_delivery_status, status)
+                statuses_processed += int(result["handled"])
             profiles = {p.get("wa_id"): p.get("profile", {}).get("name", "")
                         for p in value.get("contacts", [])}
             for message in value.get("messages", []):
@@ -286,4 +294,4 @@ async def inbound_whatsapp(request: Request):
                 processed += 1
     # Deliver queued replies outside the order transaction. A worker also retries failures.
     # The tracked outbox worker delivers replies independently of this webhook.
-    return {"received": True, "processed": processed}
+    return {"received": True, "processed": processed, "statuses_processed": statuses_processed}

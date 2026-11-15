@@ -204,6 +204,80 @@ class OrderLogicOfflineTests(unittest.TestCase):
         self.assert_order_error(self.draft, 409, phone="923009990000", source_key="same-source")
         self.assertEqual(self.store.count("orders"), 1)
 
+    def test_source_key_rejects_changed_payload_but_retries_original_after_edit_and_confirmation(self):
+        order = self.draft(source_key="original-order")
+        original = dict(phone=self.phone, name="Demo customer",
+                        items=[{"product_id": self.product["id"], "quantity": 1}],
+                        delivery_address="12 Main Street, Lahore", payment_method="COD",
+                        source_key="original-order")
+        for changed in ({"name": "Different customer name"}, {"delivery_address": "Another address"},
+                        {"payment_method": "BANK_TRANSFER"},
+                        {"items": [{"product_id": self.product["id"], "quantity": 2}]}):
+            with self.subTest(changed=changed):
+                error = self.assert_order_error(self.service.create_draft, 409, **(original | changed))
+                self.assertIn("different order details", error.message)
+        self.service.edit_draft(order["id"],
+            [{"product_id": self.product["id"], "quantity": 2}], "Edited address", "BANK_TRANSFER")
+        self.service.confirm(order["id"])
+        retried = self.service.create_draft(**original)
+        self.assertEqual(retried["id"], order["id"])
+        self.assertEqual(retried["status"], "CONFIRMED")
+        self.assertEqual(retried["delivery_address"], "Edited address")
+        self.assertEqual(self.stock(), 0)
+        self.assertEqual(self.store.count("orders"), 1)
+        self.assertEqual(self.store.count("financial_entries"), 1)
+
+    def test_owner_confirmation_of_whatsapp_draft_queues_once(self):
+        self.service.chat("live-order", self.phone, "ORDER TEE-01 1 | Lahore | COD", live=True)
+        order = self.service.list_orders()[0]
+        self.assertEqual(self.store.count("outbox"), 1)
+        first = self.service.confirm(order["id"])
+        self.service.confirm(order["id"])
+        self.assertEqual(first["status"], "CONFIRMED")
+        messages = self.store.all("outbox")
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[-1]["phone"], self.phone)
+        self.assertIn(f"Order {order['id']}: CONFIRMED", messages[-1]["body"])
+        self.assertEqual(self.stock(), 1)
+        self.assertEqual(self.store.count("financial_entries"), 1)
+
+    def test_owner_risk_hold_of_whatsapp_draft_queues_once_without_booking(self):
+        os.environ["SHOPSYNC_RISK_AMOUNT_CENTS"] = "100000"
+        self.service.chat("live-held-order", self.phone, "ORDER TEE-01 1 | Lahore | COD", live=True)
+        order = self.service.list_orders()[0]
+        self.service.confirm(order["id"])
+        self.service.confirm(order["id"])
+        messages = self.store.all("outbox")
+        self.assertEqual(len(messages), 2)
+        self.assertIn("RISK_HOLD", messages[-1]["body"])
+        self.assertIn("Awaiting owner review", messages[-1]["body"])
+        self.assertEqual(self.stock(), 2)
+        self.assertEqual(self.net(), 0)
+        self.assertEqual(self.store.count("approvals"), 1)
+
+    def test_customer_whatsapp_confirmation_queues_only_its_chat_reply(self):
+        self.service.chat("live-chat-order", self.phone, "ORDER TEE-01 1 | Lahore | COD", live=True)
+        order = self.service.list_orders()[0]
+        reply = self.service.chat("live-confirm", self.phone, f"CONFIRM {order['id']}", live=True)
+        self.assertIn("CONFIRMED", reply)
+        self.assertEqual(self.store.count("outbox"), 2)
+        self.assertEqual(self.service.chat("live-confirm", self.phone,
+                                         f"CONFIRM {order['id']}", live=True), reply)
+        self.assertEqual(self.store.count("outbox"), 2)
+        self.assertEqual(self.store.count("financial_entries"), 1)
+
+    def test_owner_confirmation_notification_failure_rolls_back_booking(self):
+        self.service.chat("live-atomic-order", self.phone, "ORDER TEE-01 1 | Lahore | COD", live=True)
+        order = self.service.list_orders()[0]
+        with patch.object(self.service, "queue_message", side_effect=RuntimeError("outbox write failed")):
+            with self.assertRaisesRegex(RuntimeError, "outbox write failed"):
+                self.service.confirm(order["id"])
+        self.assertEqual(self.service.get_order(order["id"])["status"], "DRAFT")
+        self.assertEqual(self.stock(), 2)
+        self.assertEqual(self.net(), 0)
+        self.assertEqual(self.store.count("stock_movements"), 0)
+        self.assertEqual(self.store.count("outbox"), 1)
+
     def test_risk_hold_approval_and_rejection(self):
         os.environ["SHOPSYNC_RISK_AMOUNT_CENTS"] = "100000"
         first, second = self.draft(), self.draft()
@@ -279,6 +353,67 @@ class OrderLogicOfflineTests(unittest.TestCase):
         self.assertIn("Reason: Outside policy", reply)
         self.assertEqual(self.stock(), 1)
         self.assertEqual(self.net(), 150000)
+
+    def test_refund_command_retries_report_pending_and_rejected_status_with_reason(self):
+        order = self.draft()
+        self.service.confirm(order["id"])
+        command = f"REFUND {order['id']} Wrong size"
+        first = self.service.chat("refund-first", self.phone, command)
+        retried = self.service.chat("refund-pending-retry", self.phone, command)
+        self.assertIn("pending owner review", first)
+        self.assertEqual(retried, first)
+        request_id = self.service.get_order(order["id"])["return_request"]["id"]
+        self.service.decide_return(request_id, False, "Outside policy")
+        rejected = self.service.chat("refund-rejected-retry", self.phone, command)
+        self.assertIn("rejected", rejected)
+        self.assertIn("Reason: Outside policy", rejected)
+        self.assertNotIn("owner review", rejected)
+        self.assertEqual(self.store.count("return_requests"), 1)
+        self.assertEqual(self.net(), 150000)
+
+    def test_completed_refund_notifications_retries_and_status_explain_manual_payment(self):
+        self.service.chat("refund-live-order", self.phone,
+                          "ORDER TEE-01 1 | Lahore | BANK_TRANSFER", live=True)
+        order = self.service.list_orders()[0]
+        self.service.confirm(order["id"])
+        command = f"REFUND {order['id']} Wrong size"
+        self.service.chat("refund-live-request", self.phone, command, live=True)
+        request_id = self.service.get_order(order["id"])["return_request"]["id"]
+        self.service.decide_return(request_id, True, "Within policy")
+        notification = self.store.all("outbox")[-1]["body"]
+        retried = self.service.chat("refund-completed-retry", self.phone, command, live=True)
+        status = self.service.chat("refund-completed-status", self.phone, f"STATUS {order['id']}")
+        for reply in (notification, retried, status):
+            with self.subTest(reply=reply):
+                self.assertIn("completed", reply)
+                self.assertIn("payment is pending manual action", reply)
+                self.assertNotIn("owner review", reply)
+        self.assertEqual(self.store.count("return_requests"), 1)
+        self.assertEqual(self.store.count("financial_entries", {"kind": "REFUND"}), 1)
+        self.assertEqual(self.stock(), 1)
+        self.assertEqual(self.net(), 0)
+
+    def test_long_return_reason_retries_use_the_same_normalized_value(self):
+        order = self.draft()
+        self.service.confirm(order["id"])
+        reason = "r" * 501
+        command = f"RETURN {order['id']}   {reason}   "
+        first = self.service.chat("long-return-first", self.phone, command)
+        retried = self.service.chat("long-return-retry", self.phone, command)
+        request = self.service.get_order(order["id"])["return_request"]
+        self.assertEqual(request["reason"], "r" * 500)
+        self.assertEqual(retried, first)
+        self.assertIn("pending owner review", retried)
+        self.assertEqual(self.store.count("return_requests"), 1)
+        self.service.decide_return(request["id"], True, "Await receipt")
+        awaiting = self.service.chat("long-return-approved", self.phone, command)
+        self.assertIn("approved awaiting receipt", awaiting)
+        self.service.receive_return(request["id"], True)
+        completed = self.service.chat("long-return-completed", self.phone, command)
+        self.assertIn("completed", completed)
+        self.assertIn("payment is pending manual action", completed)
+        self.assertEqual(self.stock(), 2)
+        self.assertEqual(self.store.count("financial_entries", {"kind": "REFUND"}), 1)
 
     def test_pending_request_blocks_cancellation(self):
         order, request_id = self.requested()

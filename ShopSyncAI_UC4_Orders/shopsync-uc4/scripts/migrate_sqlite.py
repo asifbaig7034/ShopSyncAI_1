@@ -180,6 +180,9 @@ def apply_snapshot(snapshot, db_module=None):
     db_module.initialize()
 
     def import_transaction(store):
+        auxiliary = set(getattr(db_module, "COLLECTIONS", COLLECTIONS)) - set(COLLECTIONS)
+        if any(store.count(name, {}) for name in auxiliary):
+            raise MigrationError("Target contains newer messaging data; use an empty database. Nothing was overwritten.")
         marker = store.get(METADATA_COLLECTION, {"_id": MARKER_ID})
         actual_counts = {name: store.count(name, {}) for name in COLLECTIONS}
         if marker:

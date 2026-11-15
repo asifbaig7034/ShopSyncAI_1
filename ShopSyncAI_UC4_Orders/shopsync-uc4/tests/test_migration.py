@@ -176,6 +176,14 @@ class MigrationOfflineTests(unittest.TestCase):
             apply_snapshot(snapshot, occupied)
         self.assertEqual(occupied.store.count("orders", {}), 0)
         self.assertEqual(occupied.store.count(METADATA_COLLECTION, {}), 0)
+        occupied_extra = MemoryDatabase()
+        occupied_extra.COLLECTIONS = tuple(COLLECTIONS) + ("delivery_events",)
+        occupied_extra.store.insert("delivery_events", {"id": "KEEP-RECEIPT"})
+        with self.assertRaisesRegex(MigrationError, "newer messaging data"):
+            apply_snapshot(snapshot, occupied_extra)
+        self.assertEqual(occupied_extra.store.count("delivery_events", {}), 1)
+        self.assertEqual(occupied_extra.store.count("orders", {}), 0)
+        self.assertEqual(occupied_extra.store.count(METADATA_COLLECTION, {}), 0)
 
 
 @unittest.skipUnless(os.getenv("TEST_MONGODB_URI"), "Set TEST_MONGODB_URI for real replica-set migration tests")

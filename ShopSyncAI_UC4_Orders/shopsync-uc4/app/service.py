@@ -46,6 +46,28 @@ def draft_summary(order):
     return "\n".join(lines)
 
 
+def return_request_summary(order):
+    request = order["return_request"]
+    status = request["status"].replace("_", " ").lower()
+    if request["status"] == "PENDING":
+        status = "pending owner review"
+    reply = f"{request['kind'].title()} request for {order['id']}: {status}."
+    if request["status"] in ("REJECTED", "REJECTED_AFTER_INSPECTION") and request["owner_reason"]:
+        reply += f" Reason: {request['owner_reason']}"
+    if order["payment_status"] == "REFUND_REQUIRES_MANUAL_ACTION":
+        reply += " Refund recorded; payment is pending manual action by the owner."
+    return reply
+
+
+def order_status_summary(order):
+    reply = f"Order {order['id']}: {order['status']}."
+    if order["status"] == "RISK_HOLD":
+        reply += " Awaiting owner review; no stock or sale has been recorded."
+    if order["return_request"]:
+        reply += " " + return_request_summary(order)
+    return reply
+
+
 def phone_number(value):
     phone = re.sub(r"\D", "", str(value))
     if not 8 <= len(phone) <= 15:
@@ -165,11 +187,30 @@ def validate_delivery(address, payment):
 
 
 def _draft(db, phone, name, items, delivery_address, payment_method, channel, source_key, actor):
+    phone = phone_number(phone)
+    source_payload = dict(phone=phone, name=(name or "").strip(),
+                          items=[dict(product_id=product_id, quantity=quantity)
+                                 for product_id, quantity in sorted(
+                                     (item["product_id"], item["quantity"]) for item in items)],
+                          delivery_address=delivery_address.strip(),
+                          payment_method=payment_method, channel=channel)
     existing = db.get("orders", {"source_key": source_key})
     if existing:
         result = order_view(db, existing["id"])
-        if result["customer_phone"] != phone_number(phone):
+        if result["customer_phone"] != phone:
             raise OrderError("Source key is already used by another customer.", 409)
+        previous_payload = existing.get("source_payload")
+        if previous_payload is None:
+            # Older orders have no original payload snapshot. Compare the
+            # current order fields that can still be established reliably.
+            previous_payload = dict(
+                phone=result["customer_phone"], name=source_payload["name"],
+                items=sorted((dict(product_id=item["product_id"], quantity=item["quantity"])
+                              for item in result["items"]), key=lambda item: item["product_id"]),
+                delivery_address=result["delivery_address"],
+                payment_method=result["payment_method"], channel=result["channel"])
+        if previous_payload != source_payload:
+            raise OrderError("Source key was already used with different order details. Use a new source key.", 409)
         return result
     validate_delivery(delivery_address, payment_method)
     resolved, total = resolve_items(db, items)
@@ -178,7 +219,7 @@ def _draft(db, phone, name, items, delivery_address, payment_method, channel, so
     db.insert("orders", dict(
         id=order_id, customer_id=customer_id, channel=channel, status="DRAFT",
         delivery_address=delivery_address.strip(), payment_method=payment_method,
-        payment_status="UNPAID", total_cents=total, source_key=source_key,
+        payment_status="UNPAID", total_cents=total, source_key=source_key, source_payload=source_payload,
         risk_score=None, risk_reasons=[], items=resolved, revision=0,
         created_at=now(), updated_at=now(), shipped_at=None, cancelled_reason=None))
     log(db, order_id, actor, "draft_created", total_cents=total)
@@ -260,7 +301,10 @@ def _confirm(db, order_id, actor, requester_phone=None):
         log(db, order_id, actor, "risk_hold", score=score, reasons=reasons)
     else:
         _book(db, order, actor)
-    return order_view(db, order_id)
+    result = order_view(db, order_id)
+    if actor == "owner" and result["channel"] == "whatsapp":
+        queue_message(db, result["customer_phone"], order_status_summary(result))
+    return result
 
 
 @atomic
@@ -334,20 +378,21 @@ def mark_shipped(db, order_id):
 
 
 def _request_return(db, order_id, kind, reason, actor, requester_phone=None):
+    reason = reason.strip()[:500]
     order = order_view(db, order_id, requester_phone)
     existing = order["return_request"]
     if existing:
-        if existing["kind"] == kind and existing["reason"] == reason.strip():
+        if existing["kind"] == kind and existing["reason"] == reason:
             return order
         raise OrderError("A return or refund request already exists for this order.", 409)
     if order["status"] not in ("CONFIRMED", "SHIPPED"):
         raise OrderError("Only confirmed or shipped orders qualify.", 409)
-    if kind not in ("RETURN", "REFUND") or not reason.strip():
+    if kind not in ("RETURN", "REFUND") or not reason:
         raise OrderError("Choose RETURN or REFUND and give a reason.")
     window_start = datetime.fromisoformat(order["shipped_at"] or order["created_at"])
     if datetime.now(timezone.utc) > window_start + timedelta(days=int(os.getenv("SHOPSYNC_RETURN_DAYS", "14"))):
         raise OrderError("Request is outside the return window.", 409)
-    db.insert("return_requests", dict(id=uid(), order_id=order_id, kind=kind, reason=reason.strip()[:500],
+    db.insert("return_requests", dict(id=uid(), order_id=order_id, kind=kind, reason=reason,
                                      status="PENDING", owner_reason=None, created_at=now(),
                                      decided_at=None, received_at=None))
     touch(db, order_id)
@@ -386,11 +431,10 @@ def decide_return(db, request_id, approve, reason):
               {"$set": {"status": status, "owner_reason": reason.strip(), "decided_at": now()}})
     touch(db, order["id"])
     log(db, order["id"], "owner", "return_decision", approved=approve, kind=row["kind"], reason=reason.strip())
+    result = order_view(db, order["id"])
     if order["channel"] == "whatsapp":
-        queue_message(db, order["customer_phone"],
-                      f"Your {row['kind'].lower()} request for {order['id']} is {status.lower().replace('_', ' ')}." +
-                      (f" Reason: {reason.strip()}" if not approve else ""))
-    return order_view(db, order["id"])
+        queue_message(db, order["customer_phone"], return_request_summary(result))
+    return result
 
 
 @atomic
@@ -417,10 +461,10 @@ def receive_return(db, request_id, accept, reason=""):
         "status": status, "owner_reason": row["owner_reason"] if accept else reason.strip(), "received_at": now()}})
     touch(db, order["id"])
     log(db, order["id"], "owner", "return_inspected", accepted=accept, reason=reason.strip())
+    result = order_view(db, order["id"])
     if order["channel"] == "whatsapp":
-        queue_message(db, order["customer_phone"], f"Return for {order['id']} {status.lower().replace('_', ' ')}." +
-                      (f" Reason: {reason.strip()}" if not accept else ""))
-    return order_view(db, order["id"])
+        queue_message(db, order["customer_phone"], return_request_summary(result))
+    return result
 
 
 def financial_summary():
@@ -466,18 +510,10 @@ def _chat_operation(db, phone, text, name, live, message_id):
             order = _cancel(db, order_id, "customer", phone)
         else:
             order = order_view(db, order_id, phone)
-        reply = f"Order {order_id}: {order['status']}."
-        if order["status"] == "RISK_HOLD":
-            reply += " Awaiting owner review; no stock or sale has been recorded."
-        request = order["return_request"]
-        if request:
-            reply += f" {request['kind'].title()} request: {request['status'].replace('_', ' ').lower()}."
-            if request["status"] in ("REJECTED", "REJECTED_AFTER_INSPECTION") and request["owner_reason"]:
-                reply += f" Reason: {request['owner_reason']}"
-        return reply
+        return order_status_summary(order)
     if cmd in ("RETURN", "REFUND") and len(parts) == 3:
         order = _request_return(db, parts[1].upper(), cmd, parts[2], "customer", phone)
-        return f"{cmd.title()} request for {order['id']} recorded for owner review."
+        return return_request_summary(order)
     return ("Commands: ORDER SKU QTY | address | COD or BANK_TRANSFER; "
             "EDIT ORDER_ID SKU QTY | address | COD or BANK_TRANSFER; CONFIRM ORDER_ID; STATUS ORDER_ID; "
             "CANCEL ORDER_ID; RETURN ORDER_ID reason; REFUND ORDER_ID reason.")
